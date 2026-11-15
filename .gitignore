@@ -1,0 +1,16 @@
+# Bases de revisão e dados pessoais NUNCA entram no repositório (o site é público)
+*.csv
+*.tsv
+*.txt
+*.parquet
+*.parq
+*.pq
+*.xlsx
+*.xls
+*.json
+!indices/lista.json
+*.zip
+*.ipynb
+__pycache__/
+.DS_Store
+Thumbs.db

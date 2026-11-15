@@ -1,0 +1,2 @@
+*.gz binary -diff
+index.html -diff
