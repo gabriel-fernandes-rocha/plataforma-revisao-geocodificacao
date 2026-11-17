@@ -5429,6 +5429,29 @@ function geoPesoFraco(t, campo) {
   return null;
 }
 function geoCep(v) { const d = String(v === null || v === undefined ? '' : v).replace(/\D/g, ''); if (!d || /^0+$/.test(d)) return ''; return d.length > 8 ? d.slice(-8) : d.padStart(8, '0'); }
+// CEP num censo C: completo (8 dígitos) ou PREFIXO (as regras do pipeline comparam o CEP truncado em 1 a 8 dígitos).
+// nivel: quantidade de dígitos comparados, quando a base informa (match_nivel_cep). Sem ela, um CEP de 6 ou 7 dígitos é
+// tratado como completo sem o zero à esquerda se existir assim no município; senão, como prefixo; até 5 dígitos, prefixo.
+// Retorna {cep, completo, idx: Set de índices de C.ceps} ou null.
+function geoCepNoCenso(C, v, nivel) {
+  let d = String(v === null || v === undefined ? '' : v).replace(/\D/g, '');
+  if (!d || (/^0+$/.test(d) && !(nivel >= 1))) return null; // zeros só valem como prefixo quando o nível vem da base
+  if (d.length > 8) d = d.slice(-8);
+  if (nivel && nivel >= 1 && nivel < 8) {
+    const base = d.length === 8 ? d : (d.length > nivel ? d.padStart(8, '0') : d);
+    d = base.slice(0, nivel);
+  } else if (nivel === 8 || d.length === 8) {
+    d = d.padStart(8, '0'); const i = C.cepIdx.get(d);
+    return { cep: d, completo: true, idx: new Set(i === undefined ? [] : [i]) };
+  } else if (d.length >= 6 && C.cepIdx.has(d.padStart(8, '0'))) {
+    const c8 = d.padStart(8, '0'); return { cep: c8, completo: true, idx: new Set([C.cepIdx.get(c8)]) };
+  }
+  const k = 'cp:' + d; let idx = C.cache.get(k);
+  if (!idx) { idx = new Set(); C.ceps.forEach((c, i) => { if (c.startsWith(d)) idx.add(i); }); C.cache.set(k, idx); }
+  return { cep: d, completo: false, idx };
+}
+// setores (com nº de endereços) de um conjunto de CEPs
+function geoSetoresDosCeps(C, idx) { const m = new Map(); if (idx) for (const i of idx) { const x = C.cepSetor.get(i); if (x) for (const [s, n] of x) geoAdd(m, s, n); } return m; }
 function geoMunicipio(v) { const d = String(v === null || v === undefined ? '' : v).replace(/\D/g, ''); return d.length >= 6 ? d.slice(0, 7) : ''; }
 
 // Número do endereço: {n, sn, sufixo, km, original, extenso}
@@ -5717,14 +5740,14 @@ function geoPistasComplemento(C, txt) {
   }
   return out;
 }
-function geoSetoresNaRua(C, ri, num, cepI, bairroIds, residencial, pistas) {
+function geoSetoresNaRua(C, ri, num, cepSet, bairroIds, residencial, pistas) {
   const F = C.faces; const rua = C.ruas[ri];
   const dist = new Map(); const det = { modo: '', faces: [], faixa: null };
   // CEP e bairro: o trecho que confere recebe peso proporcional a quantos CEPs/bairros diferentes a rua tem
   // (se a pessoa acerta o campo 70% das vezes, a razão é 0,7 / (0,3 / K) = 2,3 K; limitada a 15)
   const nDist = arr => new Set(arr).size;
   const kCep = Math.min(15, Math.max(3, 2.33 * nDist(rua.faces.map(f => F.cep[f])))), kBai = Math.min(15, Math.max(2, 2.33 * nDist(rua.faces.map(f => F.bai[f]))));
-  const fator = f => { let w = 1; if (pistas && pistas.has(F.s[f])) w *= 3; if (cepI !== undefined && cepI >= 0 && F.cep[f] === cepI) w *= kCep; if (bairroIds && bairroIds.has(F.bai[f])) w *= kBai / 2; return w; };
+  const fator = f => { let w = 1; if (pistas && pistas.has(F.s[f])) w *= 3; if (cepSet && cepSet.size && cepSet.has(F.cep[f])) w *= kCep; if (bairroIds && bairroIds.has(F.bai[f])) w *= kBai / 2; return w; };
   if (num && num.n) {
     const n = num.n, par = n % 2;
     const mesmo = rua.faces.filter(f => F.p[f] === par), oposto = rua.faces.filter(f => F.p[f] === 1 - par);
@@ -5779,11 +5802,11 @@ function geoLocalizar(C, end, opts) {
     const m = /^(.*[A-Za-zÀ-ÿ].*?)\s*(?:,\s*|\s+N[º°o.]?\s*|\s+N[UÚ]MERO\s+)(\d{1,5})\s*$/i.exec(String(end.logradouro || '').trim());
     if (m && !end.numero && geoLogradouro(m[1]).nucleo.some(t => geoPesoFraco(t, 'logradouro') === null)) { const lg2 = geoLogradouro(m[1]); lg.nucleo = lg2.nucleo; lg.texto = lg2.texto; lg.tipo = lg.tipo || lg2.tipo; num.n = Number(m[2]); num.doLogradouro = true; }
   }
-  const cep = geoCep(end.cep); const cepI = cep && C.cepIdx.has(cep) ? C.cepIdx.get(cep) : -1;
+  const cepInfo = geoCepNoCenso(C, end.cep, opts.nivelCep); const cep = cepInfo ? cepInfo.cep : ''; const cepSet = cepInfo ? cepInfo.idx : new Set();
   const bairros = end.bairro ? geoBuscarBairros(C, end.bairro) : [];
   const bairroIds = new Set(bairros.map(b => b.i));
   const pistas = geoPistasComplemento(C, end.complemento); const setoresPista = new Set(); pistas.forEach(x => x.setores.forEach(k => setoresPista.add(k)));
-  const out = { ano: C.ano, lg, num, cep, cepNoCnefe: cepI >= 0, bairros, ruas: [], dist: new Map(), nivel: 'nenhum', det: null, pistas };
+  const out = { ano: C.ano, lg, num, cep, cepPrefixo: !!(cepInfo && !cepInfo.completo), cepSet, cepNoCnefe: cepSet.size > 0, bairros, ruas: [], dist: new Map(), nivel: 'nenhum', det: null, pistas };
   const residencial = opts.residencial !== false;
   const ruas = lg.nucleo.length ? geoBuscarRuas(C, lg) : [];
   // compatibilidade com CEP e bairro: desempata logradouros de nome parecido e aceita nomes um pouco abaixo do limite
@@ -5791,7 +5814,7 @@ function geoLocalizar(C, end, opts) {
   // ruasCandidato: nomes das ruas em que o candidato foi achado; se o nome da consulta cabe inteiro numa delas (nome
   // incompleto, ex.: "MAXIMILIANO FONSECA" x "MAXIMILIANO BARRETO DA FONSECA"), ela não é penalizada pelas palavras a mais
   const rc = opts.ruasCandidato;
-  const comp = r => { const fs = C.ruas[r.i].faces; const cp = cepI >= 0 && fs.some(f => F.cep[f] === cepI); const bp = bairroIds.size > 0 && fs.some(f => bairroIds.has(F.bai[f])); const cc = !!(rc && rc.has(C.ruas[r.i].l) && r.cobA >= 0.9); return { cp, bp, cc, aj: r.sim + (cp ? GEO_CFG.bonusCep : 0) + (bp ? GEO_CFG.bonusBairro : 0) + (cc ? GEO_CFG.bonusCandidato : 0) }; };
+  const comp = r => { const fs = C.ruas[r.i].faces; const cp = cepSet.size > 0 && fs.some(f => cepSet.has(F.cep[f])); const bp = bairroIds.size > 0 && fs.some(f => bairroIds.has(F.bai[f])); const cc = !!(rc && rc.has(C.ruas[r.i].l) && r.cobA >= 0.9); return { cp, bp, cc, aj: r.sim + (cp ? GEO_CFG.bonusCep : 0) + (bp ? GEO_CFG.bonusBairro : 0) + (cc ? GEO_CFG.bonusCandidato : 0) }; };
   const aceitas = ruas.map(r => ({ ...r, ...comp(r) })).filter(r => r.sim >= GEO_CFG.limiarRua || ((r.cp || r.bp) && r.sim >= GEO_CFG.limiarRuaCompat));
   if (aceitas.length) {
     // empate decidido no nível do NOME do logradouro; todos os trechos (bairros) do nome escolhido continuam como hipóteses,
@@ -5802,7 +5825,7 @@ function geoLocalizar(C, end, opts) {
     const best = Math.max(...sel.map(r => r.sim));
     // peso de cada trecho: tamanho (raiz do nº de endereços) x plausibilidade do número nesse trecho
     const plaus = d => (!num.n ? 1 : d.modo === 'numero_existe' ? 1 : d.modo === 'dentro_faixa' ? GEO_CFG.plausFaixa : /entre_faces/.test(d.modo) ? GEO_CFG.plausEntre : d.modo === 'alem_da_numeracao' ? 1 / (1 + d.faixa[0] / 30) : d.modo === 'so_lado_oposto' ? 0.3 : 0.2);
-    for (const r of sel) { r.sr = geoSetoresNaRua(C, r.i, num, cepI, bairroIds, residencial, setoresPista.size ? setoresPista : null); r.peso = Math.max(1, Math.sqrt(C.ruas[r.i].n)) * plaus(r.sr.det) * (r.bp ? GEO_CFG.fatorBairro : 1) * (r.cp ? GEO_CFG.fatorCep : 1) * Math.exp(-(bestAj - ajNome.get(C.ruas[r.i].l)) / GEO_CFG.escalaNomes); }
+    for (const r of sel) { r.sr = geoSetoresNaRua(C, r.i, num, cepSet, bairroIds, residencial, setoresPista.size ? setoresPista : null); r.peso = Math.max(1, Math.sqrt(C.ruas[r.i].n)) * plaus(r.sr.det) * (r.bp ? GEO_CFG.fatorBairro : 1) * (r.cp ? GEO_CFG.fatorCep : 1) * Math.exp(-(bestAj - ajNome.get(C.ruas[r.i].l)) / GEO_CFG.escalaNomes); }
     const tot = sel.reduce((a, r) => a + r.peso, 0);
     const dist = new Map();
     for (const r of sel) { r.peso /= tot; for (const [s, p] of r.sr.dist) geoAdd(dist, s, r.peso * p); }
@@ -5815,14 +5838,20 @@ function geoLocalizar(C, end, opts) {
   out.ruasRejeitadas = ruas.slice(0, 3);
   // sem logradouro: bairro e CEP
   const db = new Map(); for (const b of bairros) { const m = C.bairroSetor.get(b.i); if (m) for (const [s, n] of m) geoAdd(db, s, n); }
-  const dc = cepI >= 0 ? new Map(C.cepSetor.get(cepI) || []) : new Map();
+  const dc = geoSetoresDosCeps(C, cepSet);
   if (db.size && dc.size) {
     const inter = new Map(); for (const [s, n] of dc) if (db.has(s)) inter.set(s, n);
     out.dist = geoNormDist(inter.size ? inter : dc); out.nivel = inter.size ? 'bairro_cep' : 'cep';
   } else if (dc.size) { out.dist = geoNormDist(dc); out.nivel = 'cep'; }
   else if (db.size) { out.dist = geoNormDist(db); out.nivel = 'bairro'; }
+  else if (geoSetoresComEndereco(C).length === 1) {
+    // município com um único setor (com endereços) no censo: qualquer endereço do município está nele
+    out.dist = new Map([[geoSetoresComEndereco(C)[0], 1]]); out.nivel = 'municipio';
+  }
   return out;
 }
+// setores do censo que têm endereços no CNEFE
+function geoSetoresComEndereco(C) { if (!C.setoresComEnd) C.setoresComEnd = C.setores.map((_, i) => i).filter(i => (C.setorN ? C.setorN[i] : 1) > 0); return C.setoresComEnd; }
 
 // ---------------------------------------------------------------------------------------------------------------
 // 5. Coordenadas (CNEFE 2022) e distância
@@ -5930,7 +5959,7 @@ function geoRaioSetor(C, s) {
 // ---------------------------------------------------------------------------------------------------------------
 // 6. Comparação de dois endereços
 // ---------------------------------------------------------------------------------------------------------------
-const GEO_NIVEL_NOME = { numero: 'logradouro e número', logradouro: 'logradouro (sem número aproveitável)', bairro_cep: 'bairro e CEP', cep: 'CEP', bairro: 'bairro', nenhum: 'não localizado' };
+const GEO_NIVEL_NOME = { numero: 'logradouro e número', logradouro: 'logradouro (sem número aproveitável)', bairro_cep: 'bairro e CEP', cep: 'CEP', bairro: 'bairro', municipio: 'município (setor único)', nenhum: 'não localizado' };
 const GEO_FAIXAS = [[0.9, 'muito provável', 'mp'], [0.7, 'provável', 'p'], [0.4, 'incerto', 'i'], [0.15, 'pouco provável', 'pp'], [0, 'improvável', 'im']];
 function geoFaixa(p) { if (!Number.isFinite(p)) return { nome: 'sem informação', cls: 'na' }; for (const [lim, nome, cls] of GEO_FAIXAS) if (p >= lim) return { nome, cls }; return { nome: 'improvável', cls: 'im' }; }
 
@@ -5985,7 +6014,7 @@ function geoComparar(a, b, opts) {
     const C = M.censos[ano]; if (!C) continue;
     const lb = geoLocalizar(C, b, opts);
     const ruasCandidato = new Set(lb.ruas.filter(q => q.peso >= 0.2).map(q => C.ruas[q.i].l));
-    const la = geoLocalizar(C, a, { ...opts, ruasCandidato });
+    const la = geoLocalizar(C, a, { ...opts, nivelCep: undefined, ruasCandidato }); // o nível de CEP da regra vale só para o candidato
     const conflito = geoConflitoApoio(a, b);
     const r = { ano, la, lb, conflito, p: la.dist.size && lb.dist.size ? geoProbMesmoSetor(la, lb, conflito) : NaN };
     // setor informado do candidato (quando a base traz o setor atribuído)
@@ -6009,6 +6038,7 @@ function geoComparar(a, b, opts) {
     const aprox = c => c.precisao === 'trecho' || c.precisao === 'setor';
     if (ca && cb) res.dist = { m: geoDistM(ca.lat, ca.lon, cb.lat, cb.lon), margem: (ca.raio || 0) + (cb.raio || 0), mensuravel: !(aprox(ca) && aprox(cb)), precisao: ca.precisao === 'numero' && cb.precisao === 'numero' ? 'numero' : ca.precisao === 'setor' || cb.precisao === 'setor' ? 'setor' : 'logradouro' };
   }
+  try { res.regra = geoRegraPipeline(M, a, b, opts); } catch (e) { res.regra = null; }
   res.faixa = geoFaixa(res.p);
   geoEvidencias(res, M, a, b);
   return res;
@@ -6039,7 +6069,7 @@ function geoDescreverLocal(C, loc, quem, end, C2) {
     s += 'rua não encontrada no CNEFE ' + C.ano + (rej ? ' (a mais parecida, ' + C.ruas[rej.i].display + ', tem só ' + fmtP0(rej.sim) + ' de semelhança)' : '') + '. ';
     if (loc.nivel === 'nenhum') return s + 'Bairro e CEP também não ajudaram: não foi possível localizar.';
     const top = geoTopSetores(loc.dist, 1)[0];
-    return s + 'Localizado só pelo ' + { bairro_cep: 'bairro e CEP', cep: 'CEP', bairro: 'bairro' }[loc.nivel] + ': ' + geoPl(loc.dist.size, 'setor possível', 'setores possíveis') + (top ? '; o mais provável é ' + setor(top[0]) + ' (' + fmtP0(top[1]) + ')' : '') + '.';
+    return s + 'Localizado só pelo ' + { bairro_cep: 'bairro e CEP', cep: 'CEP', bairro: 'bairro', municipio: 'município, que tem um único setor' }[loc.nivel] + ': ' + geoPl(loc.dist.size, 'setor possível', 'setores possíveis') + (top ? '; o mais provável é ' + setor(top[0]) + ' (' + fmtP0(top[1]) + ')' : '') + '.';
   }
   const r0 = loc.ruas[0]; const rua = C.ruas[r0.i];
   const nomes = new Set(loc.ruas.map(q => C.ruas[q.i].l)).size;
@@ -6072,17 +6102,19 @@ function geoDescreverLocal(C, loc, quem, end, C2) {
 }
 // setores possíveis de uma distribuição (descarta migalhas abaixo de 2%)
 function geoOpcoes(dist) { return geoTopSetores(dist, 200).filter(x => x[1] >= 0.02); }
-function geoCepIdx(C, loc) { return loc.cep && C.cepIdx.has(loc.cep) ? C.cepIdx.get(loc.cep) : -1; }
+// conjunto de CEPs informados (o CEP completo ou todos os CEPs do prefixo); vazio quando o CEP não está no CNEFE
+function geoCepIdx(C, loc) { return loc.cepSet || new Set(); }
+function geoCepRotulo(loc) { return loc.cepPrefixo ? 'prefixo de CEP ' + loc.cep + ' (' + loc.cep.length + ' dígitos)' : 'CEP ' + loc.cep; }
 // setores do bairro e do CEP informados (null quando o campo não foi achado no CNEFE)
 function geoSetoresApoio(C, loc) {
   let bai = null; if (loc.bairros && loc.bairros.length) { bai = new Set(); for (const b of loc.bairros) { const m = C.bairroSetor.get(b.i); if (m) for (const k of m.keys()) bai.add(k); } }
-  const ci = geoCepIdx(C, loc); const cep = ci >= 0 ? new Set((C.cepSetor.get(ci) || new Map()).keys()) : null;
+  const ci = geoCepIdx(C, loc); const cep = ci.size ? new Set(geoSetoresDosCeps(C, ci).keys()) : null;
   return { bai, cep };
 }
 // como o endereço foi localizado, em poucas palavras
 function geoComoLocalizou(C, loc, quem) {
   const q = quem === 'A' ? 'a consulta' : 'o candidato';
-  if (!loc.ruas.length) return q + ' (pelo ' + ({ bairro_cep: 'bairro e CEP', cep: 'CEP', bairro: 'bairro' }[loc.nivel] || 'que foi possível') + ')';
+  if (!loc.ruas.length) return q + ' (pelo ' + ({ bairro_cep: 'bairro e CEP', cep: 'CEP', bairro: 'bairro', municipio: 'município, que tem um único setor' }[loc.nivel] || 'que foi possível') + ')';
   const nome = C.logrs[C.ruas[loc.ruas[0].i].l].display;
   return q + ' (' + (loc.nivel === 'numero' ? 'número ' + loc.num.n + ' na ' + nome : nome + (loc.num.n ? ', número fora do CNEFE' : ', sem número')) + ')';
 }
@@ -6090,8 +6122,8 @@ function geoComoLocalizou(C, loc, quem) {
 function geoMotivoSetor(C, loc, s) {
   const F = C.faces;
   if (!loc.ruas.length) {
-    const ci = geoCepIdx(C, loc); const m = ci >= 0 ? C.cepSetor.get(ci) : null;
-    if (m && m.has(s)) { let t = 0; for (const v of m.values()) t += v; return 'tem ' + fmtInt(m.get(s)) + ' dos ' + fmtInt(t) + ' endereços do CEP ' + loc.cep; }
+    const ci = geoCepIdx(C, loc); const m = ci.size ? geoSetoresDosCeps(C, ci) : null;
+    if (m && m.has(s)) { let t = 0; for (const v of m.values()) t += v; return 'tem ' + fmtInt(m.get(s)) + ' dos ' + fmtInt(t) + ' endereços do ' + geoCepRotulo(loc); }
     return 'é um dos setores do bairro informado';
   }
   let q = loc.ruas[0], best = -1; for (const r of loc.ruas) { const v = r.peso * (r.sr.dist.get(s) || 0); if (v > best) { best = v; q = r; } }
@@ -6106,7 +6138,7 @@ function geoMotivoTrecho(C, loc, q, s) {
   const fs = rua.faces.filter(f => F.s[f] === s); const cas = fs.reduce((x, f) => x + F.r[f], 0);
   let t = (n ? 'o número não está no CNEFE; ' : '') + 'o setor tem ' + fmtP0(rua.r ? cas / rua.r : NaN) + ' das casas da ' + nome;
   const ci = geoCepIdx(C, loc); const bi = new Set((loc.bairros || []).map(b => b.i));
-  const cepOk = ci >= 0 && fs.some(f => F.cep[f] === ci), baiOk = bi.size && fs.some(f => bi.has(F.bai[f]));
+  const cepOk = ci.size > 0 && fs.some(f => ci.has(F.cep[f])), baiOk = bi.size && fs.some(f => bi.has(F.bai[f]));
   if (cepOk || baiOk) t += ', e ' + (cepOk && baiOk ? 'o bairro e o CEP informados são' : cepOk ? 'o CEP informado é' : 'o bairro informado é') + ' deste trecho';
   return t;
 }
@@ -6144,23 +6176,140 @@ function geoCombinacao(C, loc, end, quem) {
   const sRua = conta(() => true);
   const partes = ['a ' + nome + ' tem trechos em ' + geoPl(sRua.size, 'setor', 'setores')];
   let final = sRua;
-  const bTxt = end.bairro ? (bi.size ? 'com o bairro ' + end.bairro : null) : null, cTxt = loc.cep ? (ci >= 0 ? 'com o CEP ' + loc.cep : null) : null;
+  const bTxt = end.bairro ? (bi.size ? 'com o bairro ' + end.bairro : null) : null, cTxt = loc.cep ? (ci.size ? 'com o ' + geoCepRotulo(loc) : null) : null;
   if (end.bairro && !bi.size) partes.push('o bairro ' + end.bairro + ' não foi achado');
-  if (loc.cep && ci < 0) partes.push('o CEP ' + loc.cep + ' não aparece');
+  if (loc.cep && !ci.size) partes.push('o ' + geoCepRotulo(loc) + ' não aparece');
   if (bTxt) { const m = conta(f => bi.has(F.bai[f])); partes.push(bTxt + ', ' + m.size); if (m.size) final = m; }
-  if (cTxt) { const m = conta(f => F.cep[f] === ci); partes.push(cTxt + ', ' + m.size); if (m.size) final = m; }
-  if (bTxt && cTxt) { const m = conta(f => bi.has(F.bai[f]) && F.cep[f] === ci); partes.push('com bairro e CEP juntos, ' + m.size); if (m.size) final = m; }
+  if (cTxt) { const m = conta(f => ci.has(F.cep[f])); partes.push(cTxt + ', ' + m.size); if (m.size) final = m; }
+  if (bTxt && cTxt) { const m = conta(f => bi.has(F.bai[f]) && ci.has(F.cep[f])); partes.push('com bairro e CEP juntos, ' + m.size); if (m.size) final = m; }
   const lista = Array.from(final.entries()).sort((x, y) => y[1] - x[1]);
   let fim = lista.length === 1 ? '. A combinação leva a um único setor: ' + C.setores[lista[0][0]] + '.'
     : '. Setores: ' + lista.slice(0, 4).map(([s, n]) => C.setores[s] + ' (' + geoPl(n, 'endereço', 'endereços') + ')').join('; ') + (lista.length > 4 ? '; e outros ' + (lista.length - 4) : '') + '.';
   if (final !== sRua) { let ch = 0; for (const s of final.keys()) ch += loc.dist.get(s) || 0; fim += ' ' + (quem === 'A' ? 'A consulta' : 'O candidato') + ' tem ' + fmtP0(ch) + ' de chance de estar ' + (lista.length === 1 ? 'nele' : 'neles') + (ch < 0.9 ? ' (o restante fica com ruas de nome parecido ou com trechos em que o bairro e o CEP do cadastro são outros, porque o informado nem sempre confere com o CNEFE)' : '') + '.'; }
-  return { txt: partes.join('; ') + fim, n: lista.length, chave: l + '|' + Array.from(bi).sort().join(',') + '|' + ci };
+  return { txt: partes.join('; ') + fim, n: lista.length, chave: l + '|' + Array.from(bi).sort().join(',') + '|' + loc.cep };
+}
+// ---------------------------------------------------------------------------------------------------------------
+// 6b. Regra do pipeline: em quantos setores a combinação de campos da regra aparece no CNEFE
+// ---------------------------------------------------------------------------------------------------------------
+// As regras determinísticas do pipeline de geocodificação (rules_definitions.py) pareiam o endereço ao CNEFE por
+// igualdade exata em uma combinação de campos e aceitam o setor quando a combinação ocorre em 1 setor (fases 1 e 2) ou
+// em 2 a 4 setores (fases 3 e 4), no CNEFE 2010 ou 2022. Nas regras com CEP, o CEP é comparado truncado em 1 a 8
+// dígitos (match_nivel_cep). Esta seção refaz a contagem no índice territorial, de forma independente do pipeline, para
+// que o revisor veja a evidência de que a combinação leva ao setor atribuído.
+const GEO_REGRA_TOKENS = { LOGR: 'logradouro', LOGRADOURO: 'logradouro', NUMERO: 'numero', NUM: 'numero', BAIRRO: 'bairro', CEP: 'cep' };
+const GEO_REGRAS_PIPELINE = ['MUNICIPIO+LOGR+NUMERO+BAIRRO+CEP', 'MUNICIPIO+LOGR+NUMERO+CEP', 'MUNICIPIO+LOGR+NUMERO+BAIRRO', 'MUNICIPIO+LOGR+NUMERO',
+  'MUNICIPIO+LOGR+BAIRRO+CEP', 'MUNICIPIO+LOGR+CEP', 'MUNICIPIO+BAIRRO+CEP', 'MUNICIPIO+CEP', 'MUNICIPIO+LOGR+BAIRRO', 'MUNICIPIO+LOGR', 'MUNICIPIO+BAIRRO', 'MUNICIPIO'];
+const GEO_CAMPO_NOME = { logradouro: 'logradouro', numero: 'número', bairro: 'bairro', cep: 'CEP' };
+function geoParseRegra(nome) {
+  if (nome === null || nome === undefined) return null;
+  const up = String(nome).trim().toUpperCase().replace(/\s+/g, '');
+  if (!/^MUNICIPIO(\+|$)/.test(up)) return null;
+  const campos = [];
+  for (const t of up.split('+').slice(1)) { const c = GEO_REGRA_TOKENS[t.replace(/_?\d+$/, '')]; if (!c) return null; if (!campos.includes(c)) campos.push(c); }
+  return { nome: up, campos };
+}
+function geoDigitos(v) { return String(v === null || v === undefined ? '' : v).replace(/\D/g, ''); }
+// Setores (com nº de endereços) em que a combinação dos campos do endereço aparece num censo
+function geoCombinacaoCampos(C, end, campos, nivelCep) {
+  const F = C.faces; const out = { campos: {}, setores: new Map(), metodo: '', faltou: null };
+  let L = null, B = null, S = null, nn = null;
+  if (campos.includes('logradouro')) {
+    const lg = geoLogradouro(end.logradouro || ''); let ids = lg.texto ? (C.porTexto.get(lg.texto) || []).slice() : []; let como = 'nome igual';
+    if (!ids.length && lg.nucleo.length) { ids = geoBuscarRuas(C, lg).filter(x => x.sim >= 0.95).map(x => x.i); como = 'nome quase igual (95% ou mais)'; }
+    L = new Set(ids.map(i => C.ruas[i].l));
+    out.campos.logradouro = { valor: end.logradouro || '', encontrado: L.size > 0, como: L.size ? como : 'não encontrado', nomes_no_cnefe: Array.from(L).slice(0, 3).map(l => C.logrs[l].display) };
+  }
+  if (campos.includes('numero')) { nn = geoNumero(end.numero).n; out.campos.numero = { valor: end.numero || '', encontrado: !!nn }; }
+  if (campos.includes('bairro')) {
+    const tk = geoTokens(end.bairro || '').join(' '); let ids = tk ? C.bairros.filter(x => x.tokens.join(' ') === tk).map(x => x.i) : []; let como = 'nome igual';
+    if (!ids.length && tk) { ids = geoBuscarBairros(C, end.bairro).filter(x => x.sim >= 0.95).map(x => x.i); como = 'nome quase igual (95% ou mais)'; }
+    B = new Set(ids); out.campos.bairro = { valor: end.bairro || '', encontrado: B.size > 0, como: B.size ? como : 'não encontrado' };
+  }
+  if (campos.includes('cep')) {
+    const info = geoCepNoCenso(C, end.cep, nivelCep); S = info ? info.idx : new Set();
+    out.campos.cep = { valor: info ? info.cep : '', prefixo: !!(info && !info.completo), digitos: info ? info.cep.length : 0, encontrado: S.size > 0, ceps_no_cnefe: S.size };
+  }
+  const falta = Object.entries(out.campos).find(([, v]) => !v.encontrado);
+  if (falta) { out.faltou = falta[0]; out.metodo = 'campo não encontrado no CNEFE'; return out; }
+  const add = (s, n) => out.setores.set(s, (out.setores.get(s) || 0) + n);
+  const okFace = f => (nn === null || F.nums[f].includes(nn)) && (!B || B.has(F.bai[f])) && (!S || S.has(F.cep[f]));
+  if (L) {
+    for (const r of C.ruas) if (L.has(r.l)) for (const f of r.faces) if (okFace(f)) add(F.s[f], nn !== null ? 1 : F.n[f]);
+    out.metodo = 'trechos de quadra do logradouro' + (B || S ? '; bairro e CEP de cada trecho são os mais frequentes do trecho' : '');
+  } else if (B && S) {
+    for (let f = 0; f < C.nFaces; f++) if (okFace(f)) add(F.s[f], F.n[f]);
+    out.metodo = 'trechos de quadra com o bairro e o CEP (os mais frequentes de cada trecho)';
+  } else if (S) { for (const [s, n] of geoSetoresDosCeps(C, S)) add(s, n); out.metodo = 'endereços por CEP e setor'; }
+  else if (B) { for (const b of B) { const m = C.bairroSetor.get(b); if (m) for (const [s, n] of m) add(s, n); } out.metodo = 'endereços por bairro e setor'; }
+  else { for (const s of geoSetoresComEndereco(C)) add(s, C.setorN ? C.setorN[s] : 1); out.metodo = 'setores do município'; }
+  return out;
+}
+// A consulta tem, nos campos da regra, o mesmo valor do candidato? (normalização da plataforma)
+function geoConcordaCampo(campo, a, b, cepCand) {
+  if (campo === 'logradouro') { const x = geoLogradouro(a.logradouro || '').texto, y = geoLogradouro(b.logradouro || '').texto; return x && y ? x === y : null; }
+  if (campo === 'numero') { const x = geoNumero(a.numero).n, y = geoNumero(b.numero).n; return x && y ? x === y : null; }
+  if (campo === 'bairro') { const x = geoTokens(a.bairro || '').join(' '), y = geoTokens(b.bairro || '').join(' '); return x && y ? x === y : null; }
+  if (campo === 'cep') { const x = geoCep(a.cep); return x && cepCand ? x.startsWith(cepCand) : null; }
+  return null;
+}
+function geoRegraPipeline(M, a, b, opts) {
+  opts = opts || {};
+  let pr = geoParseRegra(opts.regra), origem = 'coluna regra_geocodificacao';
+  if (!pr) {
+    // sem a coluna da regra: só quando o candidato tem a forma de um par das regras (sem logradouro ou com CEP truncado)
+    const d = geoDigitos(b.cep);
+    if (!b.setor || (b.logradouro && !(d && d.length <= 5))) return null;
+    const campos = ['logradouro', 'numero', 'bairro', 'cep'].filter(c => String(b[c] || '').trim());
+    pr = { nome: ['MUNICIPIO'].concat(campos.map(c => ({ logradouro: 'LOGR', numero: 'NUMERO', bairro: 'BAIRRO', cep: 'CEP' })[c])).join('+'), campos };
+    origem = 'inferida dos campos preenchidos do candidato';
+  }
+  const nivelCep = opts.nivelCep ? Number(opts.nivelCep) : undefined;
+  const out = { nome: pr.nome, origem, campos: pr.campos, nivel_cep: nivelCep || null, por_censo: {}, consulta_concorda: {} };
+  let cepCand = null;
+  for (const ano of ['2010', '2022']) {
+    const C = M.censos[ano]; if (!C) continue;
+    const cb = geoCombinacaoCampos(C, b, pr.campos, nivelCep);
+    if (cb.campos.cep && cb.campos.cep.valor) cepCand = cb.campos.cep.valor;
+    const nivA = cb.campos.cep && cb.campos.cep.prefixo ? cb.campos.cep.digitos : nivelCep;
+    const ca = geoCombinacaoCampos(C, a, pr.campos, nivA);
+    const sc = b.setor ? geoDigitos(b.setor).slice(0, 15) : ''; const si = sc ? C.setores.indexOf(sc) : -1;
+    const lista = Array.from(cb.setores.entries()).sort((x, y) => y[1] - x[1]);
+    out.por_censo[ano] = {
+      n_setores: cb.faltou ? null : cb.setores.size, metodo: cb.metodo, campo_nao_encontrado: cb.faltou,
+      campos: cb.campos, setores: lista.slice(0, 10).map(([s, n]) => ({ setor: C.setores[s], enderecos: n })),
+      setor_atribuido: sc || null, setor_atribuido_existe_no_censo: si >= 0, setor_atribuido_na_combinacao: si >= 0 && !cb.faltou ? cb.setores.has(si) : null,
+      consulta_n_setores: ca.faltou ? null : ca.setores.size, consulta_no_setor_atribuido: si >= 0 && !ca.faltou ? ca.setores.has(si) : null,
+    };
+  }
+  for (const c of pr.campos) out.consulta_concorda[c] = geoConcordaCampo(c, a, b, cepCand);
+  const anos = Object.values(out.por_censo);
+  out.combinacao_unica_com_setor_atribuido = anos.some(x => x.n_setores === 1 && x.setor_atribuido_na_combinacao);
+  out.combinacao_ate_4_setores_com_setor_atribuido = anos.some(x => x.n_setores >= 1 && x.n_setores <= 4 && x.setor_atribuido_na_combinacao);
+  return out;
+}
+function geoRegraTexto(rg) {
+  const campos = rg.campos.length ? rg.campos.map(c => GEO_CAMPO_NOME[c]).join(', ') : 'nenhum além do município';
+  let t = 'Regra do pipeline ' + rg.nome + ' (' + rg.origem + '; campos comparados além do município: ' + campos + ').';
+  for (const [ano, x] of Object.entries(rg.por_censo)) {
+    const cep = x.campos.cep; const cepTxt = cep && cep.valor ? (cep.prefixo ? ' com o prefixo de CEP ' + cep.valor + ' (' + cep.digitos + ' dígitos, ' + geoPl(cep.ceps_no_cnefe, 'CEP', 'CEPs') + ' no município)' : ' com o CEP ' + cep.valor) : '';
+    if (x.campo_nao_encontrado) { const v = x.campos[x.campo_nao_encontrado]; t += ' CNEFE ' + ano + ': o ' + GEO_CAMPO_NOME[x.campo_nao_encontrado] + ' do candidato' + (v && v.valor ? ' (' + v.valor + ')' : '') + ' não aparece no município.'; continue; }
+    t += ' CNEFE ' + ano + ': a combinação' + cepTxt + ' aparece em ' + geoPl(x.n_setores, 'setor', 'setores');
+    if (x.setores.length) t += ' (' + x.setores.slice(0, 4).map(z => z.setor + ': ' + fmtInt(z.enderecos) + ' end.').join('; ') + (x.n_setores > 4 ? '; e outros ' + (x.n_setores - 4) : '') + ')';
+    if (x.setor_atribuido) t += x.setor_atribuido_existe_no_censo ? (x.setor_atribuido_na_combinacao ? '; o setor atribuído está entre eles' : '; o setor atribuído NÃO está entre eles') : '; o setor atribuído não existe neste censo';
+    if (x.consulta_n_setores !== null && x.consulta_no_setor_atribuido !== null) t += '. Com os valores da consulta, a mesma combinação dá ' + geoPl(x.consulta_n_setores, 'setor', 'setores') + (x.consulta_no_setor_atribuido ? ', incluindo o atribuído' : ', sem o atribuído');
+    t += ' [' + x.metodo + '].';
+  }
+  const dis = Object.entries(rg.consulta_concorda).filter(([, v]) => v === false).map(([c]) => GEO_CAMPO_NOME[c]);
+  if (dis.length) t += ' Na normalização da plataforma, a consulta difere do candidato em: ' + dis.join(', ') + ' (o pipeline compara a forma bruta ou normalizada do próprio pipeline).';
+  return t;
 }
 function geoEvidencias(res, M, a, b) {
   const ev = []; const add = (sinal, txt, peso) => ev.push({ sinal, txt, peso: peso || 1 });
   const anos = Object.keys(res.censos);
   if (!b.logradouro && !b.bairro && !b.cep) add('?', b.setor ? 'O candidato não tem rua, bairro nem CEP: a comparação usa só o setor atribuído (' + String(b.setor).replace(/\D/g, '') + ').' : 'O candidato está vazio (sem rua, bairro, CEP ou setor): considere o rótulo 3, sem candidato.');
+  const evRegra = () => { if (!res.regra) return; const rg = res.regra; const anosR = Object.values(rg.por_censo); const contra = anosR.length > 0 && anosR.every(x => x.setor_atribuido_na_combinacao === false || x.campo_nao_encontrado); add(rg.combinacao_unica_com_setor_atribuido ? '+' : contra ? '-' : '~', geoRegraTexto(rg), 2); };
   if (!res.ok) {
+    evRegra();
     add('?', res.motivo || 'Sem informação suficiente para localizar os endereços no CNEFE.');
     res.evid = ev; res.justLinhas = [{ titulo: 'Conclusão', linhas: [res.motivo || 'Sem informação suficiente.'] }]; res.justificativa = ev.map(e => e.txt).join(' '); res.resumo = 'sem informação'; return;
   }
@@ -6173,6 +6322,8 @@ function geoEvidencias(res, M, a, b) {
     if (!ta || !tb) msg += ' Um dos endereços não foi localizado neste censo.';
     add(r.p >= 0.7 ? '+' : r.p < 0.3 ? '-' : '~', msg.trim(), 2);
   }
+  // 1a. regra do pipeline (pares das regras determinísticas)
+  evRegra();
   // 1b. combinação rua + bairro + CEP: em quantos setores cabe (consulta e candidato, em cada censo)
   for (const ano of anos) {
     const r = res.censos[ano]; const C = M.censos[ano];
@@ -6268,8 +6419,13 @@ function geoEvidencias(res, M, a, b) {
     add('~', 'O complemento da consulta cita palavra rara no município: ' + ps + '. ' + (usou ? 'Como não há número, os trechos da rua nesses setores ganharam mais peso para localizar a consulta.' : 'Ela foi usada como pista para os setores.'));
   }
   // 6. CEP
-  const ca = geoCep(a.cep), cb = geoCep(b.cep);
-  if (ca && cb) {
+  const lbAny = (res.censos['2022'] || res.censos['2010'] || {}).lb;
+  const cbPref = lbAny && lbAny.cepPrefixo ? lbAny.cep : null;
+  const ca = geoCep(a.cep), cb = cbPref ? null : geoCep(b.cep);
+  if (ca && cbPref) {
+    if (ca.startsWith(cbPref)) add('+', 'O CEP da consulta (' + ca + ') começa com o prefixo de CEP do candidato (' + cbPref + ', ' + cbPref.length + ' dígitos), que é o que a regra comparou.');
+    else add('-', 'O CEP da consulta (' + ca + ') não começa com o prefixo de CEP do candidato (' + cbPref + ').');
+  } else if (ca && cb) {
     if (ca === cb) add(/000$/.test(ca) ? '~' : '+', 'Mesmo CEP (' + ca + ')' + (/000$/.test(ca) ? ', mas é um CEP geral da cidade (termina em 000): ajuda pouco.' : '.'), /000$/.test(ca) ? 0.5 : 1);
     else if (ca.slice(0, 5) === cb.slice(0, 5)) add('~', 'CEPs diferentes, mas da mesma região postal (mesmos 5 primeiros dígitos): ' + ca + ' e ' + cb + '.');
     else add('-', 'CEPs diferentes: ' + ca + ' e ' + cb + '.');
@@ -7026,6 +7182,8 @@ function geoRvAlin() {
 }
 function geoRvAtivo() { return (GEO.municipios.size > 0 || geoFonteAtiva()) && geoAlinValido(geoRvAlin()); }
 function geoRvTemColuna() { return geoRvAtivo() || !!geoRvColunasSalvas(); }
+// colunas do pipeline com a regra que deu o setor e o nível do CEP comparado (opcionais; procuradas pelo nome)
+function geoRvColunasRegra() { const H = RV.header || []; const ach = rx => H.findIndex(h => rx.test(String(h))); return { regra: ach(/^(regra_geocodificacao|regra)$/i), nivel: ach(/^(match_nivel_cep|nivel_cep)$/i) }; }
 function geoRvResultado(r) {
   if (!RV.geoCache) RV.geoCache = new Map();
   if (RV.geoCache.has(r)) return RV.geoCache.get(r);
@@ -7034,7 +7192,9 @@ function geoRvResultado(r) {
     // município da linha ainda não está na memória: pede o carregamento e mostra "carregando" (o registro é recalculado depois)
     if (geoRvPedirMunicipio(r) || GEO_FONTE.carregando.has(geoRvCodigoLinha(r))) { const pend = { ok: false, p: NaN, pendente: true }; RV.geoCache.set(r, pend); return pend; }
     const { a, b } = geoEnderecosDaLinha(RV.rows[r], geoRvAlin());
-    try { res = geoComparar(a, b, { residencial: GEO_UI.residencial }); res.a = a; res.b = b; res.fonte = 'indice'; } catch (e) { console.error(e); res = null; }
+    const rg = geoRvColunasRegra(); const row = RV.rows[r];
+    const regra = rg.regra >= 0 ? row[rg.regra] : undefined, nivelCep = rg.nivel >= 0 ? parseNumberLoose(row[rg.nivel]) : NaN;
+    try { res = geoComparar(a, b, { residencial: GEO_UI.residencial, regra, nivelCep: Number.isFinite(nivelCep) && nivelCep > 0 ? nivelCep : undefined }); res.a = a; res.b = b; res.fonte = 'indice'; } catch (e) { console.error(e); res = null; }
   }
   if (!res || (!res.ok && geoRvColunasSalvas())) {
     const c = geoRvColunasSalvas();
@@ -7469,7 +7629,7 @@ function geoRvRegistro(r) {
   const arred = (x, k) => (Number.isFinite(x) ? Number(x.toFixed(k === undefined ? 4 : k)) : null);
   const H = RV.header; const alin = geoRvAlin() || {};
   const o = {
-    versao: 1, calculado_em: nowIso(), municipio: res.municipio || null,
+    versao: 2, calculado_em: nowIso(), municipio: res.municipio || null,
     probabilidade_mesmo_setor: arred(res.p), faixa: res.faixa ? res.faixa.nome : 'sem informação',
     regra: 'mesmo setor em pelo menos um dos censos (CNEFE 2010 ou 2022); vale a maior probabilidade',
     por_censo: {}, setor_atribuido_candidato: null,
@@ -7484,6 +7644,8 @@ function geoRvRegistro(r) {
     endereco_consulta: res.a || null, endereco_candidato: res.b || null,
     motivo_sem_informacao: res.ok ? null : (res.motivo || 'sem informação suficiente'),
   };
+  // regra do pipeline: combinação de campos refeita no índice (quantos setores, se o setor atribuído está entre eles)
+  o.regra_pipeline = res.regra || null;
   if (res.indice) o.indice = res.indice;
   for (const ano of Object.keys(res.censos || {})) {
     const c = res.censos[ano]; const z = c.resumo || { consulta: {}, candidato: {} };
