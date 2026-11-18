@@ -5624,6 +5624,7 @@ function geoPrepararCenso(c, ano) {
     const r = C.ruas[i]; r.faces.push(f); r.n += F.n[f]; r.r += F.r[f];
   }
   const trechos = new Map(); for (const r of C.ruas) trechos.set(r.l, (trechos.get(r.l) || 0) + 1);
+  C.ruasPorLogr = new Map(); for (const r of C.ruas) { let l = C.ruasPorLogr.get(r.l); if (!l) { l = []; C.ruasPorLogr.set(r.l, l); } l.push(r.i); }
   for (const r of C.ruas) { const b = c.bairros[r.bairro]; r.nTrechos = trechos.get(r.l); if (r.nTrechos > 1 && b) r.display += ' (' + b + ')'; }
   // vocabulário e raridade dos tokens (idf sobre nomes distintos de logradouro)
   const df = new Map(); const porToken = new Map(); const porTexto = new Map();
@@ -5681,33 +5682,54 @@ function geoSegmentar(C, toks) {
   }
   return out;
 }
-function geoBuscarRuas(C, lg0) {
+// Busca as ruas do CNEFE parecidas com o nome informado. Usada por TODA a plataforma (probabilidade, resumo por campo,
+// evidências, justificativa e mapa), para que todas as partes falem da mesma rua.
+// * Palavras do nome informado que não existem em nenhuma rua do município e não se parecem com nenhuma (ex.: "DSA" em
+//   "RUA DSA ALEGRIA") são tratadas como erro de digitação: a semelhança também é calculada sem elas, com uma pequena
+//   penalidade por palavra ignorada, desde que reste ao menos uma palavra informativa. As palavras ignoradas ficam
+//   registradas no resultado (campo 'ignoradas') e aparecem no painel.
+// * 'extras': ruas (índices de logradouro) que devem ser testadas mesmo que a busca não as encontre (a rua do outro lado
+//   do par).
+// * O resultado guarda também a rua mais parecida abaixo do limiar ('melhor'), para o painel dizer qual é.
+function geoBuscarRuas(C, lg0, extras) {
   const lg = { ...lg0, nucleo: geoSegmentar(C, lg0.nucleo) }; lg.texto = lg.nucleo.join(' ');
-  const chave = lg.tipo + '|' + lg.texto;
-  if (C.cache.has('r:' + chave)) return C.cache.get('r:' + chave);
+  const chave = 'r:' + lg.tipo + '|' + lg.texto + '|' + (extras && extras.size ? Array.from(extras).sort((x, y) => x - y).join(',') : '');
+  if (C.cache.has(chave)) return C.cache.get(chave);
   const cand = new Set();
-  const toks = lg.nucleo;
+  const toks = lg.nucleo; const comAcerto = new Set();
   // candidatos: logradouros que têm algum token igual ou parecido (fuzzy contra o vocabulário do município)
   for (const t of toks) {
+    const ex = C.porToken.get(t); if (ex) comAcerto.add(t);
     if (geoPesoFraco(t, 'logradouro') !== null && toks.length > 1) continue;
-    const ex = C.porToken.get(t); if (ex) ex.forEach(i => cand.add(i));
+    if (ex) ex.forEach(i => cand.add(i));
     if (t.length >= 4 && !/^\d+$/.test(t)) {
       const iniciais = new Set([t[0], geoFonetica(t)[0]]);
-      for (const ini of iniciais) for (const v of (C.vocabPorLetra.get(ini) || [])) if (v !== t && Math.abs(v.length - t.length) <= 3 && geoSimToken(t, v) >= GEO_CFG.limiarToken) C.porToken.get(v).forEach(i => cand.add(i));
+      for (const ini of iniciais) for (const v of (C.vocabPorLetra.get(ini) || [])) if (v !== t && Math.abs(v.length - t.length) <= 3 && geoSimToken(t, v) >= GEO_CFG.limiarToken) { comAcerto.add(t); C.porToken.get(v).forEach(i => cand.add(i)); }
     }
   }
-  const out = [];
+  if (extras) for (const l of extras) for (const i of (C.ruasPorLogr ? C.ruasPorLogr.get(l) || [] : C.ruas.filter(r => r.l === l).map(r => r.i))) cand.add(i);
+  // palavras desconhecidas no município (prováveis erros de digitação); números nunca são ignorados
+  const desconhecidas = toks.filter(t => !comAcerto.has(t) && !/\d/.test(t) && geoPesoFraco(t, 'logradouro') === null);
+  const restantes = toks.filter(t => !desconhecidas.includes(t));
+  const usarRestantes = desconhecidas.length > 0 && desconhecidas.length <= 2 && restantes.some(t => geoPesoFraco(t, 'logradouro') === null);
+  const out = []; let melhor = null;
   for (const i of cand) {
     const r = C.ruas[i];
     const s = geoSimNomes(toks, r.nucleo, C.idf, C.idf);
-    let sim = s.sim;
+    let sim = s.sim, ignoradas = [], pares = s.pares, cobA = s.cobA, cobB = s.cobB;
+    if (usarRestantes) {
+      const s2 = geoSimNomes(restantes, r.nucleo, C.idf, C.idf); const sim2 = s2.sim - 0.05 * desconhecidas.length;
+      if (sim2 > sim) { sim = sim2; ignoradas = desconhecidas.slice(); pares = s2.pares; cobA = s2.cobA; cobB = s2.cobB; }
+    }
     // o tipo (RUA, AVENIDA, TRAVESSA...) diferente reduz um pouco: no mesmo município há "RUA X" e "TRAVESSA X"
     if (lg.tipo && r.tipo && lg.tipo !== r.tipo) sim -= GEO_CFG.penalTipo;
-    if (sim >= GEO_CFG.limiarRua - 0.15) out.push({ i, sim, pares: s.pares, cobA: s.cobA, cobB: s.cobB });
+    const item = { i, sim, pares, cobA, cobB, ignoradas };
+    if (!melhor || sim > melhor.sim) melhor = item;
+    if (sim >= GEO_CFG.limiarRua - 0.15) out.push(item);
   }
   out.sort((a, b) => b.sim - a.sim || C.ruas[b.i].n - C.ruas[a.i].n);
-  const res = out.slice(0, 12);
-  C.cache.set('r:' + chave, res);
+  const res = out.slice(0, 12); res.melhor = melhor; res.desconhecidas = usarRestantes ? desconhecidas : [];
+  C.cache.set(chave, res);
   return res;
 }
 function geoBuscarBairros(C, txt) {
@@ -5816,7 +5838,8 @@ function geoLocalizar(C, end, opts) {
   const pistas = geoPistasComplemento(C, end.complemento); const setoresPista = new Set(); pistas.forEach(x => x.setores.forEach(k => setoresPista.add(k)));
   const out = { ano: C.ano, lg, num, cep, cepPrefixo: !!(cepInfo && !cepInfo.completo), cepSet, cepNoCnefe: cepSet.size > 0, bairros, ruas: [], dist: new Map(), nivel: 'nenhum', det: null, pistas };
   const residencial = opts.residencial !== false;
-  const ruas = lg.nucleo.length ? geoBuscarRuas(C, lg) : [];
+  const ruas = lg.nucleo.length ? geoBuscarRuas(C, lg, opts.ruasCandidato) : [];
+  out.desconhecidas = ruas.desconhecidas || [];
   // compatibilidade com CEP e bairro: desempata logradouros de nome parecido e aceita nomes um pouco abaixo do limite
   const F = C.faces;
   // ruasCandidato: nomes das ruas em que o candidato foi achado; se o nome da consulta cabe inteiro numa delas (nome
@@ -5834,16 +5857,19 @@ function geoLocalizar(C, end, opts) {
     // peso de cada trecho: tamanho (raiz do nº de endereços) x plausibilidade do número nesse trecho
     const plaus = d => (!num.n ? 1 : d.modo === 'numero_existe' ? 1 : d.modo === 'dentro_faixa' ? GEO_CFG.plausFaixa : /entre_faces/.test(d.modo) ? GEO_CFG.plausEntre : d.modo === 'alem_da_numeracao' ? 1 / (1 + d.faixa[0] / 30) : d.modo === 'so_lado_oposto' ? 0.3 : 0.2);
     for (const r of sel) { r.sr = geoSetoresNaRua(C, r.i, num, cepSet, bairroIds, residencial, setoresPista.size ? setoresPista : null); r.peso = Math.max(1, Math.sqrt(C.ruas[r.i].n)) * plaus(r.sr.det) * (r.bp ? GEO_CFG.fatorBairro : 1) * (r.cp ? GEO_CFG.fatorCep : 1) * Math.exp(-(bestAj - ajNome.get(C.ruas[r.i].l)) / GEO_CFG.escalaNomes); }
-    const tot = sel.reduce((a, r) => a + r.peso, 0);
+    // trechos com menos de 1% saem da lista E da distribuição (renormalizada): o que o painel mostra explica 100% da chance
+    let tot = sel.reduce((a, r) => a + r.peso, 0);
+    for (const r of sel) r.peso /= tot;
+    sel = sel.filter(r => r.peso >= 0.01).sort((x, y) => y.peso - x.peso);
+    tot = sel.reduce((a, r) => a + r.peso, 0);
     const dist = new Map();
     for (const r of sel) { r.peso /= tot; for (const [s, p] of r.sr.dist) geoAdd(dist, s, r.peso * p); }
-    sel = sel.filter(r => r.peso >= 0.01).sort((x, y) => y.peso - x.peso);
     out.ruas = sel; out.dist = geoNormDist(dist);
     out.nivel = num.n && sel.some(r => /numero_existe|dentro_faixa|entre_faces/.test(r.sr.det.modo)) ? 'numero' : 'logradouro';
-    out.simRua = best;
+    out.simRua = best; out.ignoradas = sel.length ? sel[0].ignoradas || [] : [];
     return out;
   }
-  out.ruasRejeitadas = ruas.slice(0, 3);
+  out.ruasRejeitadas = ruas.length ? ruas.slice(0, 3) : (ruas.melhor ? [ruas.melhor] : []);
   // sem logradouro: bairro e CEP
   const db = new Map(); for (const b of bairros) { const m = C.bairroSetor.get(b.i); if (m) for (const [s, n] of m) geoAdd(db, s, n); }
   const dc = geoSetoresDosCeps(C, cepSet);
@@ -6001,10 +6027,13 @@ function geoProbMesmoSetor(la, lb, conflito) {
   m = Math.min(1, m);
   la.mesmaRua = lb.mesmaRua = m;
   if (m <= 0) return pInd;
-  if (m >= 0.999) return Math.min(1, pc);
   // fora da rua compartilhada (chance 1 - m), os dois são independentes: produto das sobras normalizadas
   let sa = 0, sb = 0; for (const v of restoA.values()) sa += v; for (const v of restoB.values()) sb += v;
-  let pr = 0; if (sa > 0 && sb > 0) for (const [s, p] of restoA) { const q = restoB.get(s); if (q) pr += (p / sa) * (q / sb); }
+  // sem massa fora da rua compartilhada (pesos dos trechos um pouco diferentes nos dois lados), a parte independente usa
+  // as distribuições completas: se as duas estão inteiras num mesmo setor, a chance é 100%
+  let pr = 0;
+  if (sa > 1e-9 && sb > 1e-9) { for (const [s, p] of restoA) { const q = restoB.get(s); if (q) pr += (p / sa) * (q / sb); } }
+  else pr = pInd;
   return Math.min(1, pc + (1 - m) * pr);
 }
 
@@ -6047,7 +6076,7 @@ function geoComparar(a, b, opts) {
     if (ca && cb) res.dist = { m: geoDistM(ca.lat, ca.lon, cb.lat, cb.lon), margem: (ca.raio || 0) + (cb.raio || 0), mensuravel: !(aprox(ca) && aprox(cb)), precisao: ca.precisao === 'numero' && cb.precisao === 'numero' ? 'numero' : ca.precisao === 'setor' || cb.precisao === 'setor' ? 'setor' : 'logradouro' };
   }
   try { res.regra = geoRegraPipeline(M, a, b, opts); } catch (e) { res.regra = null; }
-  try { res.resumoCampos = geoResumoCampos(M, a, b); } catch (e) { console.error(e); res.resumoCampos = []; }
+  try { res.resumoCampos = geoResumoCampos(M, a, b, res); } catch (e) { console.error(e); res.resumoCampos = []; }
   res.faixa = geoFaixa(res.p);
   geoEvidencias(res, M, a, b);
   return res;
@@ -6070,7 +6099,7 @@ function geoNumeroNoCenso(C2, texto, n) {
 }
 function geoDescreverLocal(C, loc, quem, end, C2) {
   const F = C.faces; const rot = quem === 'A' ? 'Consulta' : 'Candidato';
-  const txtEnd = [end && end.logradouro, end && end.numero].filter(Boolean).join(', ') || '(sem logradouro)';
+  const txtEnd = [end && end.logradouro, loc.num && loc.num.n ? String(loc.num.n) : end && end.numero].filter(Boolean).join(', ') || '(sem logradouro)';
   const setor = s => C.setores[s];
   let s = rot + ' (' + txtEnd + '): ';
   if (!loc.ruas.length) {
@@ -6084,7 +6113,8 @@ function geoDescreverLocal(C, loc, quem, end, C2) {
   const nomes = new Set(loc.ruas.map(q => C.ruas[q.i].l)).size;
   const nomeRua = C.logrs[rua.l].display;
   s += (quem === 'A' ? 'achada' : 'achado') + ' na ' + nomeRua + (r0.sim < 0.995 ? ' (' + fmtP0(r0.sim) + ' de semelhança no nome)' : '') + '. ';
-  if (nomes > 1) s += 'Há ' + nomes + ' ruas de nome parecido no município; esta é a mais provável. ';
+  if (r0.ignoradas && r0.ignoradas.length) s += (r0.ignoradas.length === 1 ? 'A palavra ' + r0.ignoradas[0] + ' não existe' : 'As palavras ' + r0.ignoradas.join(' e ') + ' não existem') + ' em nenhuma rua do município e ' + (r0.ignoradas.length === 1 ? 'foi ignorada' : 'foram ignoradas') + '. ';
+  if (nomes > 1) { const outros = Array.from(new Set(loc.ruas.map(q => C.ruas[q.i].l))).filter(l => l !== rua.l).map(l => C.logrs[l].display); s += 'Há ' + nomes + ' ruas de nome parecido no município (também ' + outros.join(', ') + '); esta é a mais provável (' + fmtP0(loc.ruas.filter(q => C.ruas[q.i].l === rua.l).reduce((x, q) => x + q.peso, 0)) + '). '; }
   if (loc.ruas.length > nomes) s += 'Existe rua com esse nome em ' + geoPl(loc.ruas.length, 'bairro', 'bairros') + '; o mais provável é ' + (C.bairros[rua.bairro] ? C.bairros[rua.bairro].raw : '(sem bairro)') + ' (' + fmtP0(r0.peso) + '). ';
   const nSet = new Set(rua.faces.map(f => F.s[f])).size;
   const d = r0.sr.det; const n = loc.num.n; const f0 = d.faces[0], f1 = d.faces[1];
@@ -6315,212 +6345,192 @@ function geoRegraTexto(rg) {
 // ---------------------------------------------------------------------------------------------------------------
 // 6c. Resumo por campo: frases curtas, uma por campo, antes das evidências
 // ---------------------------------------------------------------------------------------------------------------
-// Para cada campo (logradouro, logradouro e número, bairro, CEP e as combinações), procura no CNEFE de cada censo o
-// valor mais próximo do informado na consulta e no candidato (tolerando erros de digitação) e diz em quantos setores ele
-// cai, quais setores a consulta e o candidato têm em comum e se o setor atribuído está entre eles.
-const GEO_RESUMO = { limiarParecido: 0.70, maxCodigos: 3 };
-// semelhança entre o nome informado e um nome do CNEFE, tolerante a erro de digitação:
-// a maior entre (1) palavras parecidas ponderadas pela raridade, (2) letras parecidas no nome inteiro (Jaro-Winkler) e
-// (3) nome do CNEFE contido no informado (palavras a mais, como "DSA ALEGRIA" x "ALEGRIA")
-function geoSimTolerante(ta, tb, idf) {
-  const s = geoSimNomes(ta, tb, idf, idf);
-  const jw = geoJaroWinkler(ta.join(''), tb.join(''));
-  let v = s.sim, como = 'palavras parecidas';
-  if (jw >= 0.8 && 0.9 * jw > v) { v = 0.9 * jw; como = 'letras parecidas'; }
-  if (s.cobB >= 0.95 && tb.some(t => geoPesoFraco(t, 'logradouro') === null) && Math.max(v, 0.85) > v) { v = 0.85; como = 'nome do CNEFE contido no informado'; }
-  if (s.cobA >= 0.95 && ta.some(t => geoPesoFraco(t, 'logradouro') === null) && Math.max(v, 0.85) > v) { v = 0.85; como = 'nome informado contido no do CNEFE'; }
-  if (ta.join(' ') === tb.join(' ')) { v = 1; como = 'nome igual'; }
-  return { sim: Math.min(1, v), como };
-}
-// rua do CNEFE mais próxima do nome informado; 'extras' são ruas que também devem ser testadas (a do outro lado do par)
-function geoRuaProxima(C, txt, extras) {
-  const lg = geoLogradouro(txt || ''); if (!lg.nucleo.length) return null;
-  const cand = new Set(geoBuscarRuas(C, lg).map(x => C.ruas[x.i].l));
-  for (const l of extras || []) if (l !== undefined && l !== null) cand.add(l);
-  let best = null;
-  for (const l of cand) { const L = C.logrs[l]; const r = geoSimTolerante(lg.nucleo, L.nucleo, C.idf); if (lg.tipo && L.tipo && lg.tipo !== L.tipo) r.sim -= GEO_CFG.penalTipo; if (!best || r.sim > best.sim) best = { l, ...r }; }
-  if (!best) return { achou: false, texto: txt };
-  if (best.sim < GEO_RESUMO.limiarParecido) return { achou: false, texto: txt, maisProxima: C.logrs[best.l].display, sim: best.sim };
-  return { achou: true, texto: txt, l: best.l, nome: C.logrs[best.l].display, sim: best.sim, como: best.como, nucleo: C.logrs[best.l].nucleo };
-}
-function geoSetoresRua(C, l, filtro) { const F = C.faces; const m = new Map(); for (const r of C.ruas) if (r.l === l) for (const f of r.faces) if (!filtro || filtro(f)) m.set(F.s[f], (m.get(F.s[f]) || 0) + F.n[f]); return m; }
-function geoSetoresRuaNumero(C, l, n) {
-  const F = C.faces;
-  const exato = geoSetoresRua(C, l, f => F.nums[f].includes(n)); if (exato.size) return { setores: exato, como: 'o número existe no CNEFE' };
-  const faixa = geoSetoresRua(C, l, f => F.p[f] === n % 2 && F.a[f] <= n && n <= F.b[f]); if (faixa.size) return { setores: faixa, como: 'o número não aparece, mas está na faixa de numeração do quarteirão' };
-  return { setores: new Map(), como: 'o número está fora da numeração da rua no CNEFE' };
-}
-function geoBairroProximo(C, txt) {
-  const tk = geoTokens(txt || ''); if (!tk.length) return null;
-  let melhor = null;
-  for (const b of C.bairros) { if (!b.tokens.length) continue; const s = geoSimTolerante(tk, b.tokens, C.idfB).sim; if (!melhor || s > melhor.sim) melhor = { i: b.i, sim: s }; }
-  if (!melhor) return { achou: false, texto: txt };
-  const nome = C.bairros[melhor.i].raw;
-  if (melhor.sim < GEO_RESUMO.limiarParecido) return { achou: false, texto: txt, maisProxima: nome, sim: melhor.sim };
-  // grafias do mesmo bairro no CNEFE (mesma forma normalizada) contam juntas
-  const norma = C.bairros[melhor.i].tokens.join(' ');
-  const ids = C.bairros.filter(x => x.tokens.join(' ') === norma).map(x => x.i);
-  return { achou: true, texto: txt, ids, nome, sim: melhor.sim, tokens: C.bairros[melhor.i].tokens };
-}
-function geoSetoresBairro(C, ids) { const m = new Map(); for (const i of ids) { const x = C.bairroSetor.get(i); if (x) for (const [s, n] of x) geoAdd(m, s, n); } return m; }
-// palavra mais rara de um nome (menos setores) e em quantos setores ela aparece
-function geoTokenRaroRua(C, nucleo) {
-  let best = null;
-  for (const t of nucleo || []) { if (geoPesoFraco(t, 'logradouro') !== null && nucleo.length > 1) continue; const ss = C.tokenSetores(t); if (ss && (!best || ss.size < best.n)) best = { token: t, n: ss.size, setores: ss }; }
-  return best;
-}
-function geoTokenRaroBairro(C, tokens) {
-  let best = null;
-  for (const t of tokens || []) {
-    if (geoPesoFraco(t, 'bairro') !== null && tokens.length > 1) continue;
-    const ss = new Set(); for (const b of C.bairros) if (b.tokens.includes(t)) { const m = C.bairroSetor.get(b.i); if (m) for (const k of m.keys()) ss.add(k); }
-    if (ss.size && (!best || ss.size < best.n)) best = { token: t, n: ss.size, setores: ss };
-  }
-  return best;
-}
+// O resumo NÃO faz casamento próprio: lê, em cada censo, as ruas, os bairros e os CEPs que o cálculo da probabilidade
+// usou para a consulta (la) e para o candidato (lb). Assim, o resumo, as evidências, a justificativa e a probabilidade
+// falam sempre da mesma rua, do mesmo número e dos mesmos setores.
+const GEO_RESUMO = { maxCodigos: 3, minAlternativa: 0.05 };
 function geoListaSetores(C, setores) {
   const l = Array.from(setores instanceof Map ? setores.keys() : setores).map(s => C.setores[s]).sort();
   return l.slice(0, GEO_RESUMO.maxCodigos).join(', ') + (l.length > GEO_RESUMO.maxCodigos ? ' e mais ' + (l.length - GEO_RESUMO.maxCodigos) : '');
 }
 function geoQtdSetores(C, setores) {
-  const n = setores instanceof Map ? setores.size : setores.size;
-  if (!n) return 'nenhum setor';
+  const n = setores.size; if (!n) return 'nenhum setor';
   return (n === 1 ? '1 único setor' : n + ' setores') + ' (' + geoListaSetores(C, setores) + ')';
 }
-function geoPct(x) { return Math.round(x * 100) + '%'; }
-function geoResumoCampos(M, a, b) {
-  const anos = ['2010', '2022'].filter(x => M.censos[x]);
-  const out = [];
+// distribuição de probabilidade sobre setores, em texto: "210...003 (98%), 210...004 (1%)"
+function geoDistTexto(C, dist) {
+  const l = geoTopSetores(dist, 50).filter(x => x[1] >= 0.005); if (!l.length) return 'nenhum setor';
+  const vis = l.slice(0, GEO_RESUMO.maxCodigos).map(([s, p]) => C.setores[s] + ' (' + fmtP0(p) + ')').join(', ');
+  return vis + (l.length > GEO_RESUMO.maxCodigos ? ' e outros ' + (l.length - GEO_RESUMO.maxCodigos) + ' com ' + fmtP0(l.slice(GEO_RESUMO.maxCodigos).reduce((x, y) => x + y[1], 0)) : '');
+}
+// ruas (nomes do CNEFE) de uma localização, somando os trechos: [{l, nome, peso, sim, ignoradas, trechos}]
+function geoRuasDaLocalizacao(C, loc) {
+  const m = new Map();
+  for (const q of loc.ruas || []) {
+    const l = C.ruas[q.i].l; let x = m.get(l);
+    if (!x) { x = { l, nome: C.logrs[l].display, peso: 0, sim: q.sim, ignoradas: q.ignoradas || [], trechos: 0 }; m.set(l, x); }
+    x.peso += q.peso; x.trechos++; if (q.sim > x.sim) x.sim = q.sim;
+  }
+  return Array.from(m.values()).sort((x, y) => y.peso - x.peso);
+}
+function geoSetoresRua(C, l, filtro) { const F = C.faces; const m = new Map(); for (const i of (C.ruasPorLogr.get(l) || [])) for (const f of C.ruas[i].faces) if (!filtro || filtro(f)) geoAdd(m, F.s[f], F.n[f]); return m; }
+function geoTokenRaroRua(C, nucleo) {
+  let best = null;
+  for (const t of nucleo || []) { if (geoPesoFraco(t, 'logradouro') !== null && nucleo.length > 1) continue; const ss = C.tokenSetores(t); if (ss && (!best || ss.size < best.n)) best = { token: t, n: ss.size, setores: ss }; }
+  return best;
+}
+function geoSetoresBairros(C, bairros) { const m = new Map(); for (const b of bairros || []) { const x = C.bairroSetor.get(b.i); if (x) for (const [s, n] of x) geoAdd(m, s, n); } return m; }
+function geoResumoCampos(M, a, b, res) {
+  const anos = Object.keys(res.censos || {}); const out = [];
+  if (!anos.length) return out;
+  const anoRef = anos.includes('2022') ? '2022' : anos[0]; const Cref = M.censos[anoRef]; const Rref = res.censos[anoRef];
   const setorAtrib = b.setor ? geoDigitos(b.setor).slice(0, 15) : '';
-  // monta um campo a partir de, em cada censo, {A: {achou, desc, setores}, B: {...}, mesmo}
-  const campo = (nome, porAno, extra, sujeito) => {
-    const partes = []; const auditoria = {}; let favor = 0, contra = 0, info = 0;
-    for (const ano of anos) {
-      const x = porAno[ano]; if (!x) continue; const C = M.censos[ano];
-      const si = setorAtrib ? C.setores.indexOf(setorAtrib) : -1;
-      let sa = x.A && x.A.setores, sb = x.B && x.B.setores;
-      if (sa && !sa.size) { x.A.vazio = x.A.vazio || 'sem ocorrência neste censo'; sa = null; }
-      if (sb && !sb.size) { x.B.vazio = x.B.vazio || 'sem ocorrência neste censo'; sb = null; }
-      let t = 'CNEFE ' + ano + ': ';
-      const comum = sa && sb ? new Set([...sa.keys()].filter(s => sb.has(s))) : null;
-      const nada = (x2, fem) => (x2 && x2.vazio ? x2.vazio : (fem ? 'não achada' : 'não achado') + ' no CNEFE');
-      const iguais = sa && sb && sa.size === sb.size && [...sa.keys()].every(k => sb.has(k));
-      if ((x.mesmo || iguais) && sa) { t += (sujeito === undefined ? '' : sujeito) + geoQtdSetores(C, sa); if (sa.size === 1) favor++; else info++; }
-      else if (sa && sb) {
-        t += 'consulta em ' + geoQtdSetores(C, sa) + '; candidato em ' + geoQtdSetores(C, sb) + '; em comum: ' + (comum.size ? geoQtdSetores(C, comum) : 'nenhum');
-        if (comum.size === 1) favor++; else if (!comum.size) contra++; else info++;
-      } else if (sb) { t += 'consulta ' + nada(x.A, true) + '; candidato em ' + geoQtdSetores(C, sb); info++; }
-      else if (sa) { t += 'candidato ' + nada(x.B, false) + '; consulta em ' + geoQtdSetores(C, sa); info++; }
-      else if (x.A && x.B && (x.A.vazio || x.B.vazio)) t += x.A.vazio === x.B.vazio || !x.B.vazio ? 'consulta e candidato: ' + (x.A.vazio || x.B.vazio) : 'consulta: ' + (x.A.vazio || 'não achada') + '; candidato: ' + x.B.vazio;
-      else t += 'nenhum dos dois achado no CNEFE';
-      const base = comum && !x.mesmo && !iguais ? comum : sa || sb;
-      const temAtrib = si >= 0 && base && base.size ? base.has(si) : null;
-      if (temAtrib !== null) t += temAtrib ? ' (inclui o atribuído)' : ' (sem o atribuído)';
-      partes.push(t + '.');
-      auditoria[ano] = {
-        consulta: x.A ? { n_setores: sa ? sa.size : null, setores: sa ? Array.from(sa.keys()).map(s => C.setores[s]) .slice(0, 10) : [] } : null,
-        candidato: x.B ? { n_setores: sb ? sb.size : null, setores: sb ? Array.from(sb.keys()).map(s => C.setores[s]).slice(0, 10) : [] } : null,
-        mesmo_valor_no_cnefe: !!x.mesmo, em_comum: comum ? comum.size : null, inclui_setor_atribuido: temAtrib,
-      };
-    }
-    if (!partes.length) return;
-    const sinal = contra && !favor ? '-' : favor && !contra ? '+' : '~';
-    out.push({ campo: nome, sinal, intro: extra || '', linhas: partes, texto: (extra ? extra + ' ' : '') + partes.join(' '), por_censo: auditoria });
+  const idxAtrib = C => (setorAtrib ? C.setores.indexOf(setorAtrib) : -1);
+  const marca = (C, setores) => { const si = idxAtrib(C); if (si < 0 || !setores || !setores.size) return ''; return setores.has(si) ? ' (inclui o atribuído)' : ' (sem o atribuído)'; };
+  const add = (campo, sinal, intro, linhas, por_censo) => out.push({ campo, sinal, intro, linhas, texto: [intro].concat(linhas).filter(Boolean).join(' '), por_censo });
+  // conjuntos por censo -> linha: iguais, ou consulta / candidato / em comum
+  const linhaConj = (ano, sa, sb, rotA, rotB) => {
+    const C = M.censos[ano]; let t = 'CNEFE ' + ano + ': '; let tipo = '~';
+    if (sa && sb) {
+      const iguais = sa.size === sb.size && [...sa.keys()].every(k => sb.has(k));
+      if (iguais) { t += geoQtdSetores(C, sa) + marca(C, sa); tipo = sa.size === 1 ? '+' : '~'; }
+      else {
+        const comum = new Map([...sa].filter(([k]) => sb.has(k)));
+        t += 'consulta em ' + geoQtdSetores(C, sa) + '; candidato em ' + geoQtdSetores(C, sb) + '; em comum: ' + (comum.size ? geoQtdSetores(C, comum) + marca(C, comum) : 'nenhum');
+        tipo = comum.size === 1 ? '+' : comum.size ? '~' : '-';
+      }
+    } else if (sa) t += (rotB || 'candidato sem informação') + '; consulta em ' + geoQtdSetores(C, sa) + marca(C, sa);
+    else if (sb) t += (rotA || 'consulta sem informação') + '; candidato em ' + geoQtdSetores(C, sb) + marca(C, sb);
+    else t += (rotA || 'consulta sem informação') + '; ' + (rotB || 'candidato sem informação');
+    return { t: t + '.', tipo, aud: { consulta: sa ? Array.from(sa.keys()).map(s => C.setores[s]).slice(0, 10) : null, candidato: sb ? Array.from(sb.keys()).map(s => C.setores[s]).slice(0, 10) : null } };
   };
-  const desc = (o, tipo) => !o ? 'vazio' : o.achou ? '"' + o.texto + '" ' + (o.sim >= 0.999 ? 'é ' : 'parece com ') + o.nome + ' (' + geoPct(o.sim) + (o.como && o.como !== 'nome igual' && o.como !== 'palavras parecidas' ? ', ' + o.como : '') + ')' : '"' + o.texto + '": não existe ' + tipo + ' parecido no CNEFE' + (o.maisProxima ? ' (o mais próximo, ' + o.maisProxima + ', tem ' + geoPct(o.sim) + ')' : '');
+  const sinalDe = tipos => (tipos.includes('-') && !tipos.includes('+') ? '-' : tipos.includes('+') && !tipos.includes('-') ? '+' : '~');
 
-  // 1. Logradouro (a rua inteira, independente do número) e a palavra mais rara do nome
-  const ruas = {};
-  for (const ano of anos) {
-    const C = M.censos[ano];
-    const B0 = geoRuaProxima(C, b.logradouro), A0 = geoRuaProxima(C, a.logradouro, B0 && B0.achou ? [B0.l] : []);
-    const B1 = A0 && A0.achou && B0 && (!B0.achou || B0.l !== A0.l) ? geoRuaProxima(C, b.logradouro, [A0.l]) : B0;
-    ruas[ano] = { A: A0, B: B1 };
-  }
-  if (a.logradouro || b.logradouro) {
-    const ano0 = anos[anos.length - 1]; const r0 = ruas[ano0];
-    let id = 'Consulta: ' + desc(r0.A, 'logradouro') + '. Candidato: ' + desc(r0.B, 'logradouro') + '.';
-    if (r0.A && r0.B && r0.A.achou && r0.B.achou) id += r0.A.l === r0.B.l ? ' É a mesma rua do CNEFE.' : ' São ruas diferentes no CNEFE.';
-    const porAno = {};
-    for (const ano of anos) { const C = M.censos[ano]; const x = ruas[ano]; const set = o => (o && o.achou ? geoSetoresRua(C, o.l) : null); porAno[ano] = { A: x.A ? { setores: set(x.A) } : null, B: x.B ? { setores: set(x.B) } : null, mesmo: x.A && x.B && x.A.achou && x.B.achou && x.A.l === x.B.l }; }
-    campo('Logradouro', porAno, id + ' Setores da rua inteira, sem olhar o número:');
-    // palavra rara
-    const C0 = M.censos[ano0]; const ref = (r0.A && r0.A.achou ? r0.A : r0.B && r0.B.achou ? r0.B : null);
+  // 1. Logradouro: qual rua do CNEFE cada lado é (a mesma usada na probabilidade) e os setores da rua inteira
+  if (String(a.logradouro || '').trim() || String(b.logradouro || '').trim()) {
+    const desc = (txt, loc, C) => {
+      if (!String(txt || '').trim()) return 'sem logradouro';
+      const rs = geoRuasDaLocalizacao(C, loc);
+      if (!rs.length) {
+        const rej = loc.ruasRejeitadas && loc.ruasRejeitadas[0];
+        return '"' + txt + '": rua não encontrada no CNEFE' + (rej ? ' (a mais parecida, ' + C.logrs[C.ruas[rej.i].l].display + ', tem ' + fmtP0(rej.sim) + ' de semelhança, abaixo do mínimo de ' + fmtP0(GEO_CFG.limiarRua) + ', ou de ' + fmtP0(GEO_CFG.limiarRuaCompat) + ' quando o bairro ou o CEP da rua conferem)' : '');
+      }
+      const r0 = rs[0];
+      let t = '"' + txt + '", no CNEFE: ' + r0.nome + ' (semelhança ' + fmtP0(r0.sim) + (rs.length > 1 ? '; chance de ser esta rua: ' + fmtP0(r0.peso) : '') + ')';
+      if (r0.ignoradas.length) t += '; ' + (r0.ignoradas.length === 1 ? 'a palavra ' + r0.ignoradas[0] + ' não existe' : 'as palavras ' + r0.ignoradas.join(' e ') + ' não existem') + ' em nenhuma rua do município e ' + (r0.ignoradas.length === 1 ? 'foi ignorada' : 'foram ignoradas') + ' (provável erro de digitação)';
+      const alt = rs.slice(1).filter(x => x.peso >= GEO_RESUMO.minAlternativa);
+      if (alt.length) t += '; outra possibilidade: ' + alt.map(x => x.nome + ' (' + fmtP0(x.peso) + ')').join(', ');
+      return t;
+    };
+    const rsA = geoRuasDaLocalizacao(Cref, Rref.la), rsB = geoRuasDaLocalizacao(Cref, Rref.lb);
+    const ids = anos.map(ano => ({ ano, t: 'Consulta: ' + desc(a.logradouro, res.censos[ano].la, M.censos[ano]) + '. Candidato: ' + desc(b.logradouro, res.censos[ano].lb, M.censos[ano]) + '.' }));
+    let intro = ids.every(x => x.t === ids[0].t) ? (anos.length > 1 ? 'No CNEFE 2010 e no 2022: ' : 'No CNEFE ' + anos[0] + ': ') + ids[0].t : ids.map(x => 'No CNEFE ' + x.ano + ': ' + x.t).join(' ');
+    const mesma = rsA.length && rsB.length && rsA[0].l === rsB[0].l;
+    if (rsA.length && rsB.length) intro += mesma ? ' Consulta e candidato estão na mesma rua do CNEFE.' : ' Estão em ruas diferentes do CNEFE.';
+    // outras ruas do município com nome parecido (que não foram escolhidas), para o revisor saber que existem
+    const escolhidas = new Set([rsA[0] && rsA[0].l, rsB[0] && rsB[0].l]);
+    const busca = String(b.logradouro || a.logradouro || '').trim() ? geoBuscarRuas(Cref, geoLogradouro(b.logradouro || a.logradouro)) : [];
+    const parecidas = Array.from(new Set(busca.filter(x => x.sim >= 0.9).map(x => Cref.ruas[x.i].l))).filter(l => !escolhidas.has(l));
+    if (parecidas.length) intro += ' No município também há: ' + parecidas.slice(0, 4).map(l => Cref.logrs[l].display + ' (' + geoQtdSetores(Cref, geoSetoresRua(Cref, l)) + ')').join('; ') + '.';
+    intro += ' Setores da rua escolhida, sem olhar o número:';
+    const linhas = [], tipos = [], aud = {};
+    for (const ano of anos) {
+      const C = M.censos[ano]; const R = res.censos[ano];
+      const a0 = geoRuasDaLocalizacao(C, R.la)[0], b0 = geoRuasDaLocalizacao(C, R.lb)[0];
+      const x = linhaConj(ano, a0 ? geoSetoresRua(C, a0.l) : null, b0 ? geoSetoresRua(C, b0.l) : null, String(a.logradouro || '').trim() ? 'rua da consulta não encontrada' : 'consulta sem logradouro', String(b.logradouro || '').trim() ? 'rua do candidato não encontrada' : 'candidato sem logradouro');
+      linhas.push(x.t); tipos.push(x.tipo); aud[ano] = { rua_consulta: a0 ? a0.nome : null, rua_candidato: b0 ? b0.nome : null, setores: x.aud };
+    }
+    add('Logradouro', sinalDe(tipos), intro, linhas, aud);
+    // palavra mais rara do nome da rua escolhida
+    const ref = rsB[0] || rsA[0];
     if (ref) {
-      const tok = geoTokenRaroRua(C0, ref.nucleo);
+      const tok = geoTokenRaroRua(Cref, Cref.logrs[ref.l].nucleo);
       if (tok) {
-        const porAnoT = {}; for (const ano of anos) { const ss = M.censos[ano].tokenSetores(tok.token); const m = new Map(); if (ss) ss.forEach(s => m.set(s, 1)); porAnoT[ano] = { A: { setores: m }, B: { setores: m }, mesmo: true }; }
-        campo('Palavra mais rara da rua', porAnoT, 'A palavra ' + tok.token + ' é a mais rara do nome. Ruas com essa palavra:', '');
+        const ls = [], au = {};
+        for (const ano of anos) { const C = M.censos[ano]; const ss = C.tokenSetores(tok.token); const m = new Map(); if (ss) ss.forEach(k => m.set(k, 1)); ls.push('CNEFE ' + ano + ': ' + geoQtdSetores(C, m) + marca(C, m) + '.'); au[ano] = m.size; }
+        add('Palavra mais rara da rua', '~', 'A palavra ' + tok.token + ' é a menos frequente do nome. Ruas do município com essa palavra:', ls, au);
       }
     }
   }
-  // 2. Logradouro e número
-  const nA = geoNumero(a.numero).n, nB = geoNumero(b.numero).n;
-  if ((nA || nB) && (a.logradouro || b.logradouro)) {
-    const porAno = {}; let como = '';
+  // 2. Logradouro e número: a distribuição de setores que a probabilidade usou (com o motivo) e a chance de mesmo setor
+  const nA = Rref.la.num.n, nB = Rref.lb.num.n;
+  if ((nA || nB) && (Rref.la.ruas.length || Rref.lb.ruas.length)) {
+    const intro = 'Número da consulta: ' + (nA || 'sem número') + '; do candidato: ' + (nB || 'sem número') + '.';
+    const motivo = (C, loc) => {
+      if (!loc.ruas.length) return null; const q = loc.ruas[0]; const d = q.sr.det; const nome = C.logrs[C.ruas[q.i].l].display; const n = loc.num.n;
+      if (!n) return 'sem número, na ' + nome;
+      return d.modo === 'numero_existe' ? 'o ' + n + ' existe na ' + nome : d.modo === 'dentro_faixa' ? 'o ' + n + ' não aparece na ' + nome + ', mas está na faixa de numeração de um quarteirão' : /entre_faces/.test(d.modo) ? 'o ' + n + ' fica entre dois quarteirões numerados da ' + nome : d.modo === 'alem_da_numeracao' ? 'o ' + n + ' passa da numeração registrada da ' + nome : d.modo === 'so_lado_oposto' ? 'na ' + nome + ', só há endereços do outro lado da rua' : 'a ' + nome + ' não tem números registrados';
+    };
+    const linhas = [], aud = {}, tipos = [];
     for (const ano of anos) {
-      const C = M.censos[ano]; const x = ruas[ano];
-      const um = (o, n) => (o && o.achou && n ? geoSetoresRuaNumero(C, o.l, n) : null);
-      const ra = um(x.A, nA), rb = um(x.B, nB);
-      if (!como && (ra || rb)) como = (ra || rb).como;
-      const vz = r2 => (r2 && !r2.setores.size ? r2.como + ' neste censo' : undefined);
-      porAno[ano] = { A: ra ? { setores: ra.setores, vazio: vz(ra) } : null, B: rb ? { setores: rb.setores, vazio: vz(rb) } : null, mesmo: x.A && x.B && x.A.achou && x.B.achou && x.A.l === x.B.l && nA && nA === nB };
+      const C = M.censos[ano]; const R = res.censos[ano]; const ma = motivo(C, R.la), mb = motivo(C, R.lb);
+      const mesmoImovel = R.la.ruas.length && R.lb.ruas.length && C.ruas[R.la.ruas[0].i].l === C.ruas[R.lb.ruas[0].i].l && nA && nA === nB;
+      let t = 'CNEFE ' + ano + ': ';
+      if (mesmoImovel) t += 'mesmo número na mesma rua (' + ma + '); setores possíveis da consulta: ' + geoDistTexto(C, R.la.dist) + '; do candidato: ' + geoDistTexto(C, R.lb.dist);
+      else t += 'consulta: ' + (ma ? ma + ', ' + geoDistTexto(C, R.la.dist) : 'rua não encontrada') + '; candidato: ' + (mb ? mb + ', ' + geoDistTexto(C, R.lb.dist) : 'rua não encontrada');
+      t += '. Chance de mesmo setor neste censo: ' + fmtP0(R.p) + '.';
+      linhas.push(t); tipos.push(R.p >= 0.7 ? '+' : R.p < 0.3 ? '-' : '~'); aud[ano] = { chance_mesmo_setor: Number.isFinite(R.p) ? Math.round(R.p * 1000) / 1000 : null, consulta: ma, candidato: mb };
     }
-    campo('Logradouro e número', porAno, 'Número da consulta: ' + (nA || 'sem número') + '; do candidato: ' + (nB || 'sem número') + (como ? ' (' + como + ')' : '') + '.');
+    // basta coincidir em um dos censos (a mesma regra da probabilidade)
+    add('Logradouro e número', tipos.includes('+') ? '+' : tipos.every(x => x === '-') ? '-' : '~', intro, linhas, aud);
   }
-  // 3. Bairro e a palavra mais rara do bairro
-  if (a.bairro || b.bairro) {
-    const porAno = {}; let id = '';
-    const bai = {}; for (const ano of anos) { const C = M.censos[ano]; bai[ano] = { A: geoBairroProximo(C, a.bairro), B: geoBairroProximo(C, b.bairro) }; }
-    const ano0 = anos[anos.length - 1]; const x0 = bai[ano0];
-    id = 'Consulta: ' + desc(x0.A, 'bairro') + '. Candidato: ' + desc(x0.B, 'bairro') + '.';
-    for (const ano of anos) { const C = M.censos[ano]; const x = bai[ano]; const set = o => (o && o.achou ? geoSetoresBairro(C, o.ids) : null); porAno[ano] = { A: x.A ? { setores: set(x.A) } : null, B: x.B ? { setores: set(x.B) } : null, mesmo: x.A && x.B && x.A.achou && x.B.achou && x.A.nome === x.B.nome }; }
-    campo('Bairro', porAno, id);
-    const ref = x0.A && x0.A.achou ? x0.A : x0.B && x0.B.achou ? x0.B : null;
-    if (ref && ref.tokens.length > 1) {
-      const tok = geoTokenRaroBairro(M.censos[ano0], ref.tokens);
-      if (tok) {
-        const porAnoT = {}; for (const ano of anos) { const t = geoTokenRaroBairro(M.censos[ano], [tok.token]); const m = new Map(); if (t) t.setores.forEach(s => m.set(s, 1)); porAnoT[ano] = { A: { setores: m }, B: { setores: m }, mesmo: true }; }
-        campo('Palavra mais rara do bairro', porAnoT, 'A palavra ' + tok.token + ' é a mais rara do nome. Bairros com essa palavra:', '');
-      }
-    }
+  // 3. Bairro (os bairros do CNEFE que a probabilidade usou)
+  if (String(a.bairro || '').trim() || String(b.bairro || '').trim()) {
+    const d = (txt, loc) => (!String(txt || '').trim() ? 'sem bairro' : loc.bairros && loc.bairros.length ? '"' + txt + '", no CNEFE: ' + loc.bairros[0].raw + ' (semelhança ' + fmtP0(loc.bairros[0].sim) + ')' : '"' + txt + '": bairro não encontrado no CNEFE');
+    const intro = 'Consulta: ' + d(a.bairro, Rref.la) + '. Candidato: ' + d(b.bairro, Rref.lb) + '.';
+    const linhas = [], tipos = [], aud = {};
+    for (const ano of anos) { const C = M.censos[ano]; const R = res.censos[ano]; const sa = R.la.bairros.length ? geoSetoresBairros(C, R.la.bairros) : null, sb = R.lb.bairros.length ? geoSetoresBairros(C, R.lb.bairros) : null; const x = linhaConj(ano, sa, sb, 'bairro da consulta não encontrado', 'bairro do candidato não encontrado'); linhas.push(x.t); tipos.push(x.tipo); aud[ano] = x.aud; }
+    add('Bairro', sinalDe(tipos), intro, linhas, aud);
   }
-  // 4. CEP (completo ou prefixo, quando o candidato traz o CEP truncado pela regra)
+  // 4. CEP (completo, ou o prefixo do candidato quando a regra comparou o CEP truncado; a consulta pelos mesmos dígitos)
   if (geoDigitos(a.cep) || geoDigitos(b.cep)) {
-    const porAno = {}; let id = '';
+    const pref = Rref.lb.cepPrefixo ? Rref.lb.cep : null;
+    const intro = 'Consulta: ' + (Rref.la.cep ? 'CEP ' + Rref.la.cep : 'sem CEP') + '. Candidato: ' + (Rref.lb.cep ? (pref ? 'prefixo ' + pref + ' (' + pref.length + ' dígitos, como a regra comparou); a consulta é comparada pelos mesmos dígitos' : 'CEP ' + Rref.lb.cep) : 'sem CEP') + '.' + (/000$/.test(Rref.la.cep || '') || /000$/.test(Rref.lb.cep || '') ? ' CEP terminado em 000 é geral da cidade e cobre muitos setores.' : '');
+    const linhas = [], tipos = [], aud = {};
     for (const ano of anos) {
-      const C = M.censos[ano]; const cb = geoCepNoCenso(C, b.cep); const nivel = cb && !cb.completo ? cb.cep.length : undefined;
-      const ca = geoCepNoCenso(C, a.cep, nivel);
-      if (!id) id = 'Consulta: ' + (ca ? (ca.completo ? 'CEP ' + ca.cep : 'prefixo ' + ca.cep) : 'sem CEP') + '. Candidato: ' + (cb ? (cb.completo ? 'CEP ' + cb.cep : 'prefixo ' + cb.cep + ' (' + cb.cep.length + ' dígitos, comparado assim pela regra)') : 'sem CEP') + (nivel ? '. A consulta foi comparada pelos mesmos ' + nivel + ' primeiros dígitos.' : '.');
-      const set = c => (c ? (c.idx.size ? geoSetoresDosCeps(C, c.idx) : new Map()) : null);
-      porAno[ano] = { A: ca ? { setores: set(ca) } : null, B: cb ? { setores: set(cb) } : null, mesmo: !!(ca && cb && ca.cep === cb.cep) };
+      const C = M.censos[ano]; const R = res.censos[ano];
+      const ia = pref ? (geoCepNoCenso(C, a.cep, pref.length) || { idx: new Set() }).idx : R.la.cepSet;
+      const sa = geoDigitos(a.cep) ? geoSetoresDosCeps(C, ia) : null, sb = geoDigitos(b.cep) ? geoSetoresDosCeps(C, R.lb.cepSet) : null;
+      const x = linhaConj(ano, sa && sa.size ? sa : null, sb && sb.size ? sb : null, geoDigitos(a.cep) ? 'CEP da consulta não existe neste censo' : 'consulta sem CEP', geoDigitos(b.cep) ? 'CEP do candidato não existe neste censo' : 'candidato sem CEP');
+      linhas.push(x.t); tipos.push(x.tipo); aud[ano] = x.aud;
     }
-    campo('CEP', porAno, id);
+    add('CEP', sinalDe(tipos), intro, linhas, aud);
   }
-  // 5. Combinações (só quando os dois lados têm os campos): trechos de quadra em que tudo confere ao mesmo tempo
+  // 5. Combinações: trechos de quadra da rua escolhida (ou do município) em que os campos conferem juntos
   const combinar = (nome, usa) => {
-    const porAno = {};
+    const linhas = [], tipos = [], aud = {}; let algum = false;
     for (const ano of anos) {
-      const C = M.censos[ano]; const F = C.faces;
-      const lado = (end, rua) => {
-        if (usa.rua && !(rua && rua.achou)) return null;
-        const bo = usa.bairro ? geoBairroProximo(C, end.bairro) : null; if (usa.bairro && !(bo && bo.achou)) return null;
-        const co = usa.cep ? geoCepNoCenso(C, end.cep) : null; if (usa.cep && !(co && co.idx.size)) return null;
-        const bi = bo ? new Set(bo.ids) : null; const m = new Map();
-        const ok = f => (!bi || bi.has(F.bai[f])) && (!co || co.idx.has(F.cep[f]));
-        if (usa.rua) { for (const r of C.ruas) if (r.l === rua.l) for (const f of r.faces) if (ok(f)) geoAdd(m, F.s[f], F.n[f]); }
-        else for (let f = 0; f < C.nFaces; f++) if (ok(f)) geoAdd(m, F.s[f], F.n[f]);
-        return m;
+      const C = M.censos[ano]; const R = res.censos[ano]; const F = C.faces;
+      const lado = (loc) => {
+        const r0 = usa.rua ? geoRuasDaLocalizacao(C, loc)[0] : null; if (usa.rua && !r0) return null;
+        const bi = usa.bairro ? new Set((loc.bairros || []).map(x => x.i)) : null; if (usa.bairro && !bi.size) return null;
+        const ci = usa.cep ? loc.cepSet : null; if (usa.cep && !(ci && ci.size)) return null;
+        const ok = f => (!bi || bi.has(F.bai[f])) && (!ci || ci.has(F.cep[f]));
+        return r0 ? geoSetoresRua(C, r0.l, ok) : (() => { const m = new Map(); for (let f = 0; f < C.nFaces; f++) if (ok(f)) geoAdd(m, F.s[f], F.n[f]); return m; })();
       };
-      const sa = lado(a, ruas[ano] && ruas[ano].A), sb = lado(b, ruas[ano] && ruas[ano].B);
-      if (sa || sb) porAno[ano] = { A: sa ? { setores: sa, vazio: 'a combinação não ocorre no CNEFE' } : null, B: sb ? { setores: sb, vazio: 'a combinação não ocorre no CNEFE' } : null, mesmo: false };
+      const sa = lado(R.la), sb = lado(R.lb); if (!sa && !sb) continue; algum = true;
+      const x = linhaConj(ano, sa && sa.size ? sa : null, sb && sb.size ? sb : null, sa ? 'a combinação da consulta não ocorre no CNEFE' : 'consulta sem esses campos no CNEFE', sb ? 'a combinação do candidato não ocorre no CNEFE' : 'candidato sem esses campos no CNEFE');
+      linhas.push(x.t); tipos.push(x.tipo); aud[ano] = x.aud;
     }
-    if (Object.keys(porAno).length) campo(nome, porAno, 'Trechos de quadra em que os campos conferem juntos.');
+    if (algum) add(nome, sinalDe(tipos), 'Trechos de quadra em que os campos conferem juntos (bairro e CEP de cada trecho: os mais frequentes do trecho).', linhas, aud);
   };
-  const tem = (c) => !!(String(a[c] || '').trim() && String(b[c] || '').trim());
+  const tem = c => !!(String(a[c] || '').trim() && String(b[c] || '').trim());
   if (tem('logradouro') && tem('bairro')) combinar('Logradouro + bairro', { rua: true, bairro: true });
   if (tem('logradouro') && geoDigitos(a.cep) && geoDigitos(b.cep)) combinar('Logradouro + CEP', { rua: true, cep: true });
   if (tem('bairro') && geoDigitos(a.cep) && geoDigitos(b.cep)) combinar('Bairro + CEP', { bairro: true, cep: true });
+  // 6. Setor atribuído: chance de a consulta estar nele, em cada censo (o mesmo código pode ser outra área no outro censo)
+  if (setorAtrib) {
+    const linhas = [], tipos = [], aud = {};
+    for (const ano of anos) {
+      const C = M.censos[ano]; const R = res.censos[ano]; const si = idxAtrib(C);
+      if (si < 0) { linhas.push('CNEFE ' + ano + ': este código de setor não existe neste censo.'); aud[ano] = null; continue; }
+      const p = R.la.dist.size ? (R.la.dist.get(si) || 0) : NaN; const top = geoTopSetores(R.la.dist, 1)[0];
+      let t = 'CNEFE ' + ano + ': ' + (Number.isFinite(p) ? 'a consulta tem ' + fmtP0(p) + ' de chance de estar nele' : 'a consulta não foi localizada');
+      if (top && top[0] !== si && Number.isFinite(p)) t += ' (o setor mais provável da consulta neste censo é ' + C.setores[top[0]] + ', com ' + fmtP0(top[1]) + ')';
+      linhas.push(t + '.'); tipos.push(p >= 0.7 ? '+' : p < 0.3 ? '-' : '~'); aud[ano] = Number.isFinite(p) ? Math.round(p * 1000) / 1000 : null;
+    }
+    add('Setor atribuído', tipos.includes('+') ? '+' : tipos.length && tipos.every(x => x === '-') ? '-' : '~', 'Setor atribuído ao candidato: ' + setorAtrib + '. Basta a consulta estar nele em um dos censos.', linhas, aud);
+  }
   return out;
 }
 function geoEvidencias(res, M, a, b) {
@@ -7669,22 +7679,25 @@ function geoMarcasAB(res, proj, W, Hh, pxm) {
   return s;
 }
 // Quadro "Precisão do mapa": o que cada ponto representa e quanto confiar nele
-function geoPrecisaoTexto(c, quem, res) {
+// ano: censo dos setores desenhados no mapa. A posição (coordenadas) vem sempre do CNEFE 2022, que é o único com
+// coordenadas; o setor e a chance de estar nele são os do censo desenhado, os mesmos da legenda e do resumo por campo.
+function geoPrecisaoTexto(c, quem, res, ano) {
   if (!c) return `<li><b>${quem}</b>: não foi possível pôr no mapa (sem coordenadas no CNEFE 2022).</li>`;
-  const M = geoMunicipioIndice(res.municipio); const C = M && M.censos['2022'];
-  const setor = C && c.setor !== undefined && c.setor !== null ? C.setores[c.setor] : '';
+  const M = geoMunicipioIndice(res.municipio); const r = res.censos && res.censos[ano];
+  const loc = r ? (quem.charAt(0) === 'A' ? r.la : r.lb) : null; const top = loc ? geoTopSetores(loc.dist, 1)[0] : null;
+  const setor = top && M ? M.censos[ano].setores[top[0]] : '';
   const oQue = { numero: 'posição do número na rua (CNEFE 2022)', lado_oposto: 'posição pelo número, mas no lado oposto da rua (este lado não tem endereços no CNEFE)', entre_trechos: 'entre os dois números vizinhos registrados no CNEFE', alem_numeracao: 'ponta da rua mais próxima do número (o número passa dos registrados)', trecho: 'sem número: ponto no trecho da rua mais provável (realçado)', setor: 'sem rua localizada: centro do setor mais provável' }[c.precisao] || 'aproximada';
-  const cert = Number.isFinite(c.certeza) ? Math.round(c.certeza * 100) : null;
+  const cert = top ? Math.round(top[1] * 100) : null;
   const nivel = cert === null ? '' : cert >= 90 ? 'alta' : cert >= 60 ? 'média' : 'baixa';
-  let t = `<li><b>${quem}</b>: ${esc(oQue)}. ` + (cert !== null ? `Chance de estar no setor mostrado${setor ? ' (' + esc(setor) + ')' : ''}: <b>${cert}%</b> (${nivel}). ` : '') + (c.raio ? `A posição pode variar até <b>${esc(fmtM(c.raio))}</b>${c.raio * 1 > 15 ? ' (círculo tracejado)' : ''}.` : '');
+  let t = `<li><b>${quem}</b>: ${esc(oQue)}. ` + (cert !== null ? `Setor mais provável no CNEFE ${esc(ano)}: <b>${esc(setor)}</b>, com chance de <b>${cert}%</b> (${nivel}). ` : '') + (c.raio ? `A posição pode variar até <b>${esc(fmtM(c.raio))}</b>${c.raio * 1 > 15 ? ' (círculo tracejado)' : ''}.` : '');
   if (c.alternativas && c.alternativas.length) t += ' Também pode estar em: ' + c.alternativas.map(al => esc(al.rua) + ' (' + Math.round(al.chance * 100) + '%, marcado com ' + quem.charAt(0) + '?)').join('; ') + '.';
   return t + '</li>';
 }
-function geoPrecisaoHtml(res) {
+function geoPrecisaoHtml(res, ano) {
   if (!res.coordA && !res.coordB) return '';
-  let t = '<div class="geo-prec small"><b>Precisão do mapa</b><ul>' + geoPrecisaoTexto(res.coordA, 'A (consulta)', res) + geoPrecisaoTexto(res.coordB, 'B (candidato)', res);
+  let t = '<div class="geo-prec small"><b>Precisão do mapa</b> (posições pelo CNEFE 2022; setores do CNEFE ' + esc(ano) + ')<ul>' + geoPrecisaoTexto(res.coordA, 'A (consulta)', res, ano) + geoPrecisaoTexto(res.coordB, 'B (candidato)', res, ano);
   if (res.dist) { const mg = res.dist.margem || 0; t += res.dist.mensuravel === false ? '<li><b>Distância</b>: não dá para medir (nenhum dos dois tem posição pelo número).</li>' : `<li><b>Distância</b>: ${esc(fmtM(res.dist.m))}${mg > 20 ? ', com margem de até ' + esc(fmtM(mg)) + ' para mais ou para menos' : ''}.</li>`; }
-  return t + '</ul><span class="muted">A chance de estar no setor vem do modelo e foi conferida com a malha oficial do IBGE: quando diz 90% ou mais, o ponto está no setor certo em 97% a 99% dos casos.</span></div>';
+  return t + '</ul><span class="muted">A chance de estar no setor é a mesma do resumo por campo e da probabilidade. Conferida com a malha oficial do IBGE: quando diz 90% ou mais, o ponto está no setor certo em 97% a 99% dos casos.</span></div>';
 }
 function geoExtensaoIncerteza(res) { return Math.max(res.coordA && res.coordA.raio || 0, res.coordB && res.coordB.raio || 0); }
 // centro do mapa: meio dos dois pontos (ou o centro do setor mais provável)
@@ -7722,7 +7735,7 @@ function geoMiniMapa(res, r) {
   if (!res.coordA && !res.coordB) svg += `<text x="${W / 2}" y="16" text-anchor="middle" class="geo-aviso-svg">centro do setor mais provável</text>`;
   const m100 = raio > 1500 ? 1000 : raio > 600 ? 500 : 100; const L = m100 * e;
   svg += `<g class="geo-escala"><line x1="10" y1="${Hh - 12}" x2="${(10 + L).toFixed(1)}" y2="${Hh - 12}"/><text x="10" y="${Hh - 17}">${m100 >= 1000 ? m100 / 1000 + ' km' : m100 + ' m'}</text></g></svg>`;
-  return geoSeletorCenso(res) + svg + geoLegendaSetores(res, ano, des) + geoPrecisaoHtml(res);
+  return geoSeletorCenso(res) + svg + geoLegendaSetores(res, ano, des) + geoPrecisaoHtml(res, ano);
 }
 // Mapa do Google com os setores desenhados por cima (projeção de Mercator do próprio mapa, centro e zoom fixos)
 // Mapa do Google com os setores desenhados por cima (projeção de Mercator do próprio mapa, centro e zoom fixos).
@@ -7749,7 +7762,7 @@ function geoMapaGoogleSpec(res) {
     W, Hh, src: `https://maps.google.com/maps?q=${ctrG.lat.toFixed(6)},${ctrG.lon.toFixed(6)}&z=${z}&t=m&output=embed`,
     topo: `<div class="geo-sub">Mapa do Google com os setores por cima ${geoSeletorCenso(res)} <label class="inline small"><input type="checkbox" data-geo-malha${GEO_UI.malhaGoogle !== false ? ' checked' : ''}> mostrar setores</label></div>`,
     svg: des.svg + geoMarcasAB(res, proj, W, Hh, 1 / mpp(z)) + cruz,
-    rodape: geoLegendaSetores(res, ano, des) + geoPrecisaoHtml(res) + `<div class="small muted">O alfinete vermelho do Google marca o centro do mapa e deve ficar sobre a cruz preta (se não ficar, o desenho dos setores está deslocado). Distância em linha reta entre A e B: <b>${res.dist ? esc(fmtM(res.dist.m)) : '-'}</b>. Para a rota a pé, use o link "rota entre os dois".</div>`,
+    rodape: geoLegendaSetores(res, ano, des) + geoPrecisaoHtml(res, ano) + `<div class="small muted">O alfinete vermelho do Google marca o centro do mapa e deve ficar sobre a cruz preta (se não ficar, o desenho dos setores está deslocado). Distância em linha reta entre A e B: <b>${res.dist ? esc(fmtM(res.dist.m)) : '-'}</b>. Para a rota a pé, use o link "rota entre os dois".</div>`,
   };
 }
 function geoAtualizarGoogle(div, r) {
