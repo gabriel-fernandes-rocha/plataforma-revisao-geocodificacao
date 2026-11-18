@@ -7,7 +7,7 @@ a base de revisão é aberta só no computador de quem revisa e **não é enviad
 
 - `index.html`: a plataforma.
 - `indices/`: índices territoriais do CNEFE 2010 e 2022 (5570 municípios) e a malha oficial de
-  setores censitários do IBGE (5572 municípios), 0.90 GB, gerados em 2026-11-17.
+  setores censitários do IBGE (5572 municípios), 0.90 GB, gerados em 2026-11-18.
   A plataforma baixa sozinha só os municípios da base aberta (lista em `indices/lista.json`).
 
 Os dados do CNEFE e as malhas são públicos (IBGE). Nunca coloque bases de revisão neste repositório:

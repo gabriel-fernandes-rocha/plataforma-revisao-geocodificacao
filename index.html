@@ -5728,7 +5728,11 @@ function geoBuscarRuas(C, lg0, extras) {
     if (sim >= GEO_CFG.limiarRua - 0.15) out.push(item);
   }
   out.sort((a, b) => b.sim - a.sim || C.ruas[b.i].n - C.ruas[a.i].n);
-  const res = out.slice(0, 12); res.melhor = melhor; res.desconhecidas = usarRestantes ? desconhecidas : [];
+  // até 12 NOMES de rua, com todos os trechos (bairros) de cada nome: cortar trechos de um mesmo nome (ex.: as dezenas de
+  // "RUA DEZ" de um município) deixaria de fora justamente o trecho do bairro ou do CEP informado
+  const nomes = new Set(); const res = [];
+  for (const x of out) { const l = C.ruas[x.i].l; if (!nomes.has(l)) { if (nomes.size >= 12) continue; nomes.add(l); } res.push(x); }
+  res.melhor = melhor; res.desconhecidas = usarRestantes ? desconhecidas : [];
   C.cache.set(chave, res);
   return res;
 }
@@ -5856,7 +5860,12 @@ function geoLocalizar(C, end, opts) {
     const best = Math.max(...sel.map(r => r.sim));
     // peso de cada trecho: tamanho (raiz do nº de endereços) x plausibilidade do número nesse trecho
     const plaus = d => (!num.n ? 1 : d.modo === 'numero_existe' ? 1 : d.modo === 'dentro_faixa' ? GEO_CFG.plausFaixa : /entre_faces/.test(d.modo) ? GEO_CFG.plausEntre : d.modo === 'alem_da_numeracao' ? 1 / (1 + d.faixa[0] / 30) : d.modo === 'so_lado_oposto' ? 0.3 : 0.2);
-    for (const r of sel) { r.sr = geoSetoresNaRua(C, r.i, num, cepSet, bairroIds, residencial, setoresPista.size ? setoresPista : null); r.peso = Math.max(1, Math.sqrt(C.ruas[r.i].n)) * plaus(r.sr.det) * (r.bp ? GEO_CFG.fatorBairro : 1) * (r.cp ? GEO_CFG.fatorCep : 1) * Math.exp(-(bestAj - ajNome.get(C.ruas[r.i].l)) / GEO_CFG.escalaNomes); }
+    // bairro e CEP que conferem com um trecho: o peso cresce com o número de trechos do mesmo nome (K), pela mesma conta
+    // usada dentro da rua (quem acerta o campo 70% das vezes: razão 0,7 / (0,3 / K) = 2,3 K; mínimo 3, limite 15). Com
+    // dezenas de ruas de mesmo nome no município, o bairro ou o CEP é o que diz qual delas é.
+    const kNome = new Map(); for (const r of sel) { const l = C.ruas[r.i].l; let x = kNome.get(l); if (!x) { x = new Set(); kNome.set(l, x); } x.add(geoRuaFisica(C, r.i)); }
+    const fatorK = (base, l) => Math.min(15, Math.max(base, 2.33 * kNome.get(l).size));
+    for (const r of sel) { r.l = C.ruas[r.i].l; r.rf = geoRuaFisica(C, r.i); r.sr = geoSetoresNaRua(C, r.i, num, cepSet, bairroIds, residencial, setoresPista.size ? setoresPista : null); r.peso = Math.max(1, Math.sqrt(C.ruas[r.i].n)) * plaus(r.sr.det) * (r.bp ? fatorK(GEO_CFG.fatorBairro, r.l) : 1) * (r.cp ? fatorK(GEO_CFG.fatorCep, r.l) : 1) * Math.exp(-(bestAj - ajNome.get(C.ruas[r.i].l)) / GEO_CFG.escalaNomes); }
     // trechos com menos de 1% saem da lista E da distribuição (renormalizada): o que o painel mostra explica 100% da chance
     let tot = sel.reduce((a, r) => a + r.peso, 0);
     for (const r of sel) r.peso /= tot;
@@ -6008,29 +6017,89 @@ function geoConflitoApoio(a, b) {
   if (a.bairro && b.bairro) { const ta = geoTokens(a.bairro), tb = geoTokens(b.bairro); const w = t => { const f = geoPesoFraco(t, 'bairro'); return f === null ? 1 : f; }; if (ta.length && tb.length && geoSimNomes(ta, tb, w, w).sim < 0.6) n++; }
   return n;
 }
+// Trechos de um mesmo nome que são a MESMA rua física: o CNEFE divide a rua pelo bairro (localidade), e uma rua que
+// atravessa dois bairros, ou cujo bairro tem duas grafias ("UNIAO DAS VILAS" e "BAIRRO UNIAO DAS VILAS"), vira dois
+// trechos. Ligam-se trechos que dividem algum setor, cujos bairros têm um nome contido no outro, cujas faixas de número
+// se continuam sem se sobrepor (mais de 80% da menor faixa fora da outra), que são os dois lados da rua (só pares de um
+// lado e só ímpares do outro), que dividem um CEP específico (não terminado em 000), ou (CNEFE 2022, com
+// coordenadas) que ficam a até 150 m um do outro. Trechos que não se ligam são ruas homônimas (ex.: a RUA DEZ de cada
+// conjunto habitacional). Retorna o grupo (rua física) do trecho i.
+function geoRuaFisica(C, i) {
+  if (!C.ruaFisica) C.ruaFisica = new Map();
+  if (C.ruaFisica.has(i)) return C.ruaFisica.get(i);
+  const F = C.faces; const ids = C.ruasPorLogr.get(C.ruas[i].l) || [i];
+  const pai = new Map(ids.map(x => [x, x])); const raiz = x => { while (pai.get(x) !== x) { pai.set(x, pai.get(pai.get(x))); x = pai.get(x); } return x; };
+  const une = (x, y) => { const a = raiz(x), b = raiz(y); if (a !== b) pai.set(a, b); };
+  if (ids.length > 1) {
+    const setores = ids.map(x => new Set(C.ruas[x].faces.map(f => F.s[f])));
+    const tokB = ids.map(x => { const b = C.bairros[C.ruas[x].bairro]; return b ? b.tokens.filter(t => geoPesoFraco(t, 'bairro') === null) : []; });
+    const temXY = F.y1 && F.y1.length;
+    const pontos = ids.map(x => { if (!temXY) return []; const fs = C.ruas[x].faces; const passo = Math.max(1, Math.floor(fs.length / 30)); const o = []; for (let k = 0; k < fs.length; k += passo) { const f = fs[k]; if (F.y1[f] !== null) { o.push([F.y1[f] / 1e5, F.x1[f] / 1e5]); o.push([F.y2[f] / 1e5, F.x2[f] / 1e5]); } } return o; });
+    const contido = (a, b) => a.length > 0 && a.every(t => b.includes(t));
+    // faixa de numeração de cada trecho: trechos de uma rua longa têm faixas que se continuam (ex.: 1-900 e 902-2400);
+    // ruas homônimas de conjuntos diferentes começam todas perto do 1 e se sobrepõem
+    const faixa = ids.map(x => { let lo = Infinity, hi = -Infinity; for (const f of C.ruas[x].faces) if (F.nums[f].length) { lo = Math.min(lo, F.a[f]); hi = Math.max(hi, F.b[f]); } return lo <= hi ? [lo, hi] : null; });
+    // lados da rua: o bairro muda no eixo da rua (pares num bairro, ímpares no outro)
+    const lados = ids.map(x => { const o = new Set(); for (const f of C.ruas[x].faces) if (F.nums[f].length) o.add(F.p[f]); return o; });
+    // CEP específico (não terminado em 000) em comum: ruas homônimas de lugares diferentes não dividem o mesmo CEP de rua
+    const cepsEsp = ids.map(x => new Set(C.ruas[x].faces.map(f => F.cep[f]).filter(k => k !== undefined && k !== null && C.ceps[k] && !/000$/.test(C.ceps[k]))));
+    const continua = (p, q) => { if (!p || !q) return false; const sob = Math.min(p[1], q[1]) - Math.max(p[0], q[0]); const menor = Math.min(p[1] - p[0], q[1] - q[0]); return menor >= 20 && sob <= 0.2 * menor; };
+    for (let a = 0; a < ids.length; a++) for (let b = a + 1; b < ids.length; b++) {
+      if (raiz(ids[a]) === raiz(ids[b])) continue;
+      let liga = [...setores[a]].some(x => setores[b].has(x)) || contido(tokB[a], tokB[b]) || contido(tokB[b], tokB[a]) || continua(faixa[a], faixa[b]) || (lados[a].size === 1 && lados[b].size === 1 && [...lados[a]][0] !== [...lados[b]][0]) || [...cepsEsp[a]].some(k => cepsEsp[b].has(k));
+      if (!liga && pontos[a].length && pontos[b].length) liga = pontos[a].some(([y, x]) => pontos[b].some(([y2, x2]) => Math.abs(y - y2) < 0.002 && geoDistM(y, x, y2, x2) <= 150));
+      if (liga) une(ids[a], ids[b]);
+    }
+  }
+  for (const x of ids) C.ruaFisica.set(x, raiz(x));
+  return C.ruaFisica.get(i);
+}
+// P(mesmo setor) em três níveis:
+// 1. NOME da rua: o mesmo texto leva os dois ao mesmo nome do CNEFE (dependentes: média geométrica dos pesos).
+// 2. RUA FÍSICA dentro do nome: ruas homônimas de lugares diferentes são escolhidas de forma independente, pelo número,
+//    bairro e CEP de cada lado. Listas iguais e espalhadas por várias RUA DEZ só dizem que nenhum dos dois endereços
+//    indica qual delas é, e não que seja a mesma.
+// 3. TRECHO dentro da rua física: dependentes como no nível 1; e mesmo número no mesmo trecho = mesmo imóvel.
 function geoProbMesmoSetor(la, lb, conflito) {
   const pInd = geoProdutoDist(la.dist, lb.dist);
+  la.mesmaRua = lb.mesmaRua = 0; la.mesmoTrecho = lb.mesmoTrecho = 0;
   if (!la.ruas.length || !lb.ruas.length) return pInd;
-  const mb = new Map(lb.ruas.map(r => [r.i, r]));
-  let m = 0, pc = 0;
-  // mesmo número no mesmo logradouro = mesmo ponto: dentro dessa hipótese o setor é o mesmo
+  const grupos = loc => { const g = new Map(); for (const r of loc.ruas) { const k = r.l !== undefined ? r.l : r.i; let x = g.get(k); if (!x) { x = { W: 0, t: [] }; g.set(k, x); } x.W += r.peso; x.t.push(r); } return g; };
+  const gA = grupos(la), gB = grupos(lb);
+  let m = 0, pc = 0, mt = 0;
   const mesmoPonto = la.num.n && lb.num.n && la.num.n === lb.num.n && !(conflito >= 2);
-  // sobra de cada distribuição depois de tirar a parte em que os dois estão no mesmo trecho de rua
+  const sobrep = (wa, wb) => conflito >= 2 ? wa * wb : GEO_CFG.sobreposicao === 'sqrt' ? Math.sqrt(wa * wb) : Math.min(wa, wb);
   const restoA = new Map(la.dist), restoB = new Map(lb.dist);
   const tira = (resto, d, w) => { for (const [s, p] of d) resto.set(s, Math.max(0, (resto.get(s) || 0) - w * p)); };
-  for (const ra of la.ruas) {
-    const rb = mb.get(ra.i); if (!rb) continue;
-    const w = conflito >= 2 ? ra.peso * rb.peso : GEO_CFG.sobreposicao === 'sqrt' ? Math.sqrt(ra.peso * rb.peso) : Math.min(ra.peso, rb.peso); m += w;
-    pc += w * (mesmoPonto ? 1 : geoProdutoDist(ra.sr.dist, rb.sr.dist));
-    tira(restoA, ra.sr.dist, w); tira(restoB, rb.sr.dist, w);
+  // distribuição de um conjunto de trechos (pesos normalizados)
+  const distDe = ts => { const d = new Map(); let W = 0; for (const r of ts) W += r.peso; if (W > 0) for (const r of ts) for (const [s, p] of r.sr.dist) geoAdd(d, s, p * r.peso / W); return d; };
+  for (const [l, A] of gA) {
+    const B = gB.get(l); if (!B || A.W <= 0 || B.W <= 0) continue;
+    const w = sobrep(A.W, B.W); m += w;
+    const fis = ts => { const g = new Map(); for (const r of ts) { const k = r.rf !== undefined ? r.rf : r.i; let x = g.get(k); if (!x) { x = { W: 0, t: [] }; g.set(k, x); } x.W += r.peso; x.t.push(r); } return g; };
+    const fA = fis(A.t), fB = fis(B.t);
+    let pl = 0, ml = 0;
+    for (const [ka, XA] of fA) for (const [kb, XB] of fB) {
+      const u = (XA.W / A.W) * (XB.W / B.W);
+      if (ka !== kb) { pl += u * geoProdutoDist(distDe(XA.t), distDe(XB.t)); continue; }
+      // mesma rua física: trechos dependentes
+      const mb = new Map(XB.t.map(r => [r.i, r])); let mi = 0, pi = 0;
+      const rA = new Map(distDe(XA.t)), rB = new Map(distDe(XB.t));
+      for (const ra of XA.t) { const rb = mb.get(ra.i); if (!rb) continue; const wi = sobrep(ra.peso / XA.W, rb.peso / XB.W); mi += wi; pi += wi * (mesmoPonto ? 1 : geoProdutoDist(ra.sr.dist, rb.sr.dist)); tira(rA, ra.sr.dist, wi); tira(rB, rb.sr.dist, wi); }
+      mi = Math.min(1, mi);
+      let sa = 0, sb = 0; for (const v of rA.values()) sa += v; for (const v of rB.values()) sb += v;
+      let pr = 0; if (sa > 1e-9 && sb > 1e-9) { for (const [s, p] of rA) { const q = rB.get(s); if (q) pr += (p / sa) * (q / sb); } } else pr = geoProdutoDist(distDe(XA.t), distDe(XB.t));
+      pl += u * Math.min(1, pi + (1 - mi) * pr); ml += u * mi;
+    }
+    pc += w * pl; mt += w * ml;
+    for (const ra of A.t) tira(restoA, ra.sr.dist, w * ra.peso / A.W);
+    for (const rb of B.t) tira(restoB, rb.sr.dist, w * rb.peso / B.W);
   }
   m = Math.min(1, m);
-  la.mesmaRua = lb.mesmaRua = m;
+  la.mesmaRua = lb.mesmaRua = m; la.mesmoTrecho = lb.mesmoTrecho = Math.min(1, mt);
   if (m <= 0) return pInd;
   // fora da rua compartilhada (chance 1 - m), os dois são independentes: produto das sobras normalizadas
   let sa = 0, sb = 0; for (const v of restoA.values()) sa += v; for (const v of restoB.values()) sb += v;
-  // sem massa fora da rua compartilhada (pesos dos trechos um pouco diferentes nos dois lados), a parte independente usa
-  // as distribuições completas: se as duas estão inteiras num mesmo setor, a chance é 100%
   let pr = 0;
   if (sa > 1e-9 && sb > 1e-9) { for (const [s, p] of restoA) { const q = restoB.get(s); if (q) pr += (p / sa) * (q / sb); } }
   else pr = pInd;
@@ -6097,6 +6166,9 @@ function geoNumeroNoCenso(C2, texto, n) {
   for (const i of (C2.porTexto.get(texto) || [])) for (const f of C2.ruas[i].faces) if (F.nums[f].includes(n)) return true;
   return false;
 }
+// quantas ruas físicas (homônimas em lugares diferentes) de um nome têm o número n; e quantas o nome tem
+function geoTrechosComNumero(C, l, n) { const F = C.faces; return new Set((C.ruasPorLogr.get(l) || []).filter(i => C.ruas[i].faces.some(f => F.nums[f].includes(n))).map(i => geoRuaFisica(C, i))).size; }
+function geoTrechosDoNome(C, l) { return new Set((C.ruasPorLogr.get(l) || []).map(i => geoRuaFisica(C, i))).size; }
 function geoDescreverLocal(C, loc, quem, end, C2) {
   const F = C.faces; const rot = quem === 'A' ? 'Consulta' : 'Candidato';
   const txtEnd = [end && end.logradouro, loc.num && loc.num.n ? String(loc.num.n) : end && end.numero].filter(Boolean).join(', ') || '(sem logradouro)';
@@ -6115,12 +6187,17 @@ function geoDescreverLocal(C, loc, quem, end, C2) {
   s += (quem === 'A' ? 'achada' : 'achado') + ' na ' + nomeRua + (r0.sim < 0.995 ? ' (' + fmtP0(r0.sim) + ' de semelhança no nome)' : '') + '. ';
   if (r0.ignoradas && r0.ignoradas.length) s += (r0.ignoradas.length === 1 ? 'A palavra ' + r0.ignoradas[0] + ' não existe' : 'As palavras ' + r0.ignoradas.join(' e ') + ' não existem') + ' em nenhuma rua do município e ' + (r0.ignoradas.length === 1 ? 'foi ignorada' : 'foram ignoradas') + '. ';
   if (nomes > 1) { const outros = Array.from(new Set(loc.ruas.map(q => C.ruas[q.i].l))).filter(l => l !== rua.l).map(l => C.logrs[l].display); s += 'Há ' + nomes + ' ruas de nome parecido no município (também ' + outros.join(', ') + '); esta é a mais provável (' + fmtP0(loc.ruas.filter(q => C.ruas[q.i].l === rua.l).reduce((x, q) => x + q.peso, 0)) + '). '; }
-  if (loc.ruas.length > nomes) s += 'Existe rua com esse nome em ' + geoPl(loc.ruas.length, 'bairro', 'bairros') + '; o mais provável é ' + (C.bairros[rua.bairro] ? C.bairros[rua.bairro].raw : '(sem bairro)') + ' (' + fmtP0(r0.peso) + '). ';
+  const variosTrechos = new Set(loc.ruas.filter(q => C.ruas[q.i].l === rua.l).map(q => geoRuaFisica(C, q.i))).size > 1;
+  if (variosTrechos) {
+    const nb = C.bairros[rua.bairro] ? C.bairros[rua.bairro].raw : '(sem bairro)';
+    s += 'Há ' + geoTrechosDoNome(C, rua.l) + ' ruas com esse nome no município, em bairros diferentes; a mais provável é a do bairro ' + nb + ' (' + fmtP0(r0.peso) + ')' + (r0.bp && r0.cp ? ', porque o bairro e o CEP informados são dela' : r0.bp ? ', porque o bairro informado é dela' : r0.cp ? ', porque o CEP informado é dela' : r0.peso < 0.5 ? ', mas nada no endereço diz qual delas é' : '') + '. ';
+  }
   const nSet = new Set(rua.faces.map(f => F.s[f])).size;
   const d = r0.sr.det; const n = loc.num.n; const f0 = d.faces[0], f1 = d.faces[1];
   const cc = 'no CNEFE ' + C.ano;
   const noOutro = () => (C2 && geoNumeroNoCenso(C2, rua.texto, n) ? ' (no CNEFE ' + C2.ano + ' ele aparece: a numeração das casas muda entre os censos)' : '');
-  if (d.modo === 'numero_existe') s += 'O número ' + n + ' existe nesta rua ' + cc + ' e fica no setor ' + setor(F.s[f0]) + '.';
+  if (d.modo === 'numero_existe' && variosTrechos) { const k = geoTrechosComNumero(C, rua.l, n); s += 'Nessa rua, o número ' + n + ' fica no setor ' + setor(F.s[f0]) + (k > 1 ? ' (o ' + n + ' existe em ' + k + ' das ruas com esse nome ' + cc + ', cada uma no seu setor)' : '') + '.'; }
+  else if (d.modo === 'numero_existe') s += 'O número ' + n + ' existe nesta rua ' + cc + ' e fica no setor ' + setor(F.s[f0]) + '.';
   else if (d.modo === 'dentro_faixa') {
     const nums = F.nums[f0];
     if (nums.length >= 60) s += 'O número ' + n + ' está na faixa de números deste lado do quarteirão (' + F.a[f0] + ' a ' + F.b[f0] + ') ' + cc + ', no setor ' + setor(F.s[f0]) + '.';
@@ -6171,7 +6248,7 @@ function geoMotivoSetor(C, loc, s) {
   return se + geoMotivoTrecho(C, loc, q, s);
 }
 function geoMotivoTrecho(C, loc, q, s) {
-  const F = C.faces; const rua = C.ruas[q.i]; const nome = C.logrs[rua.l].display; const d = q.sr.det; const n = loc.num.n;
+  const F = C.faces; const rua = C.ruas[q.i]; const nome = rua.display; const d = q.sr.det; const n = loc.num.n;
   if (/numero_existe|dentro_faixa|entre_faces_mesmo/.test(d.modo) && d.faces.some(f => F.s[f] === s)) return 'o número ' + n + ' da ' + nome + ' fica nesse setor';
   if (d.modo === 'entre_faces_setores_diferentes') return 'o número ' + n + ' fica na divisa entre dois setores da ' + nome;
   const fs = rua.faces.filter(f => F.s[f] === s); const cas = fs.reduce((x, f) => x + F.r[f], 0);
@@ -6187,7 +6264,7 @@ function geoPorque(C, r) {
   const oa = geoOpcoes(la.dist), ob = geoOpcoes(lb.dist); const ta = oa[0], tb = ob[0];
   if (!ta || !tb) return '';
   const mR = la.mesmaRua || 0;
-  if (mR >= 0.9 && la.num.n && lb.num.n && la.num.n === lb.num.n && !(r.conflito >= 2)) return 'Porque os dois têm o mesmo número na mesma rua: é o mesmo imóvel' + (ta[0] === tb[0] ? ', no setor ' + st(ta[0]) : '') + '.';
+  if ((la.mesmoTrecho || 0) >= 0.9 && la.num.n && lb.num.n && la.num.n === lb.num.n && !(r.conflito >= 2)) return 'Porque os dois têm o mesmo número na mesma rua: é o mesmo imóvel' + (ta[0] === tb[0] ? ', no setor ' + st(ta[0]) : '') + '.';
   const A = geoComoLocalizou(C, la, 'A'), B = geoComoLocalizou(C, lb, 'B');
   if (ta[1] >= 0.95 && tb[1] >= 0.95) {
     if (ta[0] === tb[0]) return 'Porque ' + A + ' e ' + B + ' levam a um único setor possível, o mesmo para os dois: ' + st(ta[0]) + ' (' + geoMotivoSetor(C, la, ta[0]) + ').';
@@ -6426,7 +6503,10 @@ function geoResumoCampos(M, a, b, res) {
     const ids = anos.map(ano => ({ ano, t: 'Consulta: ' + desc(a.logradouro, res.censos[ano].la, M.censos[ano]) + '. Candidato: ' + desc(b.logradouro, res.censos[ano].lb, M.censos[ano]) + '.' }));
     let intro = ids.every(x => x.t === ids[0].t) ? (anos.length > 1 ? 'No CNEFE 2010 e no 2022: ' : 'No CNEFE ' + anos[0] + ': ') + ids[0].t : ids.map(x => 'No CNEFE ' + x.ano + ': ' + x.t).join(' ');
     const mesma = rsA.length && rsB.length && rsA[0].l === rsB[0].l;
-    if (rsA.length && rsB.length) intro += mesma ? ' Consulta e candidato estão na mesma rua do CNEFE.' : ' Estão em ruas diferentes do CNEFE.';
+    if (rsA.length && rsB.length) {
+      const kT = mesma ? geoTrechosDoNome(Cref, rsA[0].l) : 0;
+      intro += !mesma ? ' Estão em ruas diferentes do CNEFE.' : kT > 1 ? ' Consulta e candidato têm o mesmo nome de rua no CNEFE, mas no município há ' + kT + ' ruas com esse nome, em bairros diferentes; chance de estarem na mesma delas: ' + fmtP0(Rref.la.mesmoTrecho || 0) + '.' : ' Consulta e candidato estão na mesma rua do CNEFE.';
+    }
     // outras ruas do município com nome parecido (que não foram escolhidas), para o revisor saber que existem
     const escolhidas = new Set([rsA[0] && rsA[0].l, rsB[0] && rsB[0].l]);
     const busca = String(b.logradouro || a.logradouro || '').trim() ? geoBuscarRuas(Cref, geoLogradouro(b.logradouro || a.logradouro)) : [];
@@ -6466,7 +6546,9 @@ function geoResumoCampos(M, a, b, res) {
       const C = M.censos[ano]; const R = res.censos[ano]; const ma = motivo(C, R.la), mb = motivo(C, R.lb);
       const mesmoImovel = R.la.ruas.length && R.lb.ruas.length && C.ruas[R.la.ruas[0].i].l === C.ruas[R.lb.ruas[0].i].l && nA && nA === nB;
       let t = 'CNEFE ' + ano + ': ';
-      if (mesmoImovel) t += 'mesmo número na mesma rua (' + ma + '); setores possíveis da consulta: ' + geoDistTexto(C, R.la.dist) + '; do candidato: ' + geoDistTexto(C, R.lb.dist);
+      const kN = mesmoImovel ? geoTrechosComNumero(C, C.ruas[R.la.ruas[0].i].l, nA) : 0;
+      if (mesmoImovel && kN > 1 && (R.la.mesmoTrecho || 0) < 0.9) t += 'mesmo número e mesmo nome de rua, mas o ' + nA + ' existe em ' + kN + ' ruas chamadas ' + C.logrs[C.ruas[R.la.ruas[0].i].l].display + ' (bairros diferentes) e a chance de os dois estarem na mesma é de ' + fmtP0(R.la.mesmoTrecho || 0) + '; setores possíveis da consulta: ' + geoDistTexto(C, R.la.dist) + '; do candidato: ' + geoDistTexto(C, R.lb.dist);
+      else if (mesmoImovel) t += 'mesmo número na mesma rua (' + ma + '); setores possíveis da consulta: ' + geoDistTexto(C, R.la.dist) + '; do candidato: ' + geoDistTexto(C, R.lb.dist);
       else t += 'consulta: ' + (ma ? ma + ', ' + geoDistTexto(C, R.la.dist) : 'rua não encontrada') + '; candidato: ' + (mb ? mb + ', ' + geoDistTexto(C, R.lb.dist) : 'rua não encontrada');
       t += '. Chance de mesmo setor neste censo: ' + fmtP0(R.p) + '.';
       linhas.push(t); tipos.push(R.p >= 0.7 ? '+' : R.p < 0.3 ? '-' : '~'); aud[ano] = { chance_mesmo_setor: Number.isFinite(R.p) ? Math.round(R.p * 1000) / 1000 : null, consulta: ma, candidato: mb };
@@ -6497,7 +6579,7 @@ function geoResumoCampos(M, a, b, res) {
     add('CEP', sinalDe(tipos), intro, linhas, aud);
   }
   // 5. Combinações: trechos de quadra da rua escolhida (ou do município) em que os campos conferem juntos
-  const combinar = (nome, usa) => {
+  const combinar = (nome, usa, nota) => {
     const linhas = [], tipos = [], aud = {}; let algum = false;
     for (const ano of anos) {
       const C = M.censos[ano]; const R = res.censos[ano]; const F = C.faces;
@@ -6512,12 +6594,12 @@ function geoResumoCampos(M, a, b, res) {
       const x = linhaConj(ano, sa && sa.size ? sa : null, sb && sb.size ? sb : null, sa ? 'a combinação da consulta não ocorre no CNEFE' : 'consulta sem esses campos no CNEFE', sb ? 'a combinação do candidato não ocorre no CNEFE' : 'candidato sem esses campos no CNEFE');
       linhas.push(x.t); tipos.push(x.tipo); aud[ano] = x.aud;
     }
-    if (algum) add(nome, sinalDe(tipos), 'Trechos de quadra em que os campos conferem juntos (bairro e CEP de cada trecho: os mais frequentes do trecho).', linhas, aud);
+    if (algum) add(nome, sinalDe(tipos), nota, linhas, aud);
   };
   const tem = c => !!(String(a[c] || '').trim() && String(b[c] || '').trim());
-  if (tem('logradouro') && tem('bairro')) combinar('Logradouro + bairro', { rua: true, bairro: true });
-  if (tem('logradouro') && geoDigitos(a.cep) && geoDigitos(b.cep)) combinar('Logradouro + CEP', { rua: true, cep: true });
-  if (tem('bairro') && geoDigitos(a.cep) && geoDigitos(b.cep)) combinar('Bairro + CEP', { bairro: true, cep: true });
+  if (tem('logradouro') && tem('bairro')) combinar('Logradouro + bairro', { rua: true, bairro: true }, 'Trechos de quadra das ruas com esse nome (todas as do município) cujo bairro, o mais frequente do trecho, é o informado.');
+  if (tem('logradouro') && geoDigitos(a.cep) && geoDigitos(b.cep)) combinar('Logradouro + CEP', { rua: true, cep: true }, 'Trechos de quadra das ruas com esse nome (todas as do município) cujo CEP, o mais frequente do trecho, é o informado.');
+  if (tem('bairro') && geoDigitos(a.cep) && geoDigitos(b.cep)) combinar('Bairro + CEP', { bairro: true, cep: true }, 'Trechos de quadra do município com o bairro e o CEP informados (os mais frequentes de cada trecho).');
   // 6. Setor atribuído: chance de a consulta estar nele, em cada censo (o mesmo código pode ser outra área no outro censo)
   if (setorAtrib) {
     const linhas = [], tipos = [], aud = {};
@@ -6579,17 +6661,18 @@ function geoEvidencias(res, M, a, b) {
     const nA = pesoNome(R.la), nB = pesoNome(R.lb);
     const lB = Array.from(nB.entries()).sort((x, y) => y[1] - x[1])[0][0];
     const ch = nA.get(lB) || 0; const nome = l => C.logrs[l].display;
-    if (ch >= 0.9) return { tipo: 'mesma', ch, txt: nome(lB) };
+    if (ch >= 0.9) { const kT = geoTrechosDoNome(C, lB), mt = R.la.mesmoTrecho || 0; return { tipo: 'mesma', ch, txt: nome(lB), kT, mt, varias: kT > 1 && mt < 0.9 }; }
     if (ch >= 0.05) return { tipo: 'dividida', ch, txt: Array.from(nA.entries()).sort((x, y) => y[1] - x[1]).map(([l, w]) => nome(l) + (l === lB ? ' (a do candidato)' : '') + ': ' + fmtP0(w)).join('; '), n: nA.size };
     return { tipo: 'diferente', ch, txt: 'consulta na ' + nome(Array.from(nA.entries()).sort((x, y) => y[1] - x[1])[0][0]) + '; candidato na ' + nome(lB) };
   };
   const rc = {}; for (const ano of anos) rc[ano] = ruaCenso(ano);
   if (rc[ano0]) { const x = rc[ano0]; mesmaRua = x.tipo === 'mesma' ? true : x.tipo === 'diferente' ? false : null; chanceMesmaRua = x.ch || 0; }
-  const frase = (x, onde) => x.tipo === 'mesma' ? ['+', 'Mesma rua ' + onde + ': ' + x.txt + '.']
-    : x.tipo === 'dividida' ? ['~', 'A rua da consulta (' + (a.logradouro || '') + ') combina com ' + x.n + ' ruas ' + onde + ': ' + x.txt + '. O nome está incompleto ou com erro, então a chance foi dividida entre elas; o número, o bairro e o CEP ajudam a decidir.']
+  const frase = (x, onde) => x.tipo === 'mesma' && x.varias ? ['~', 'Mesmo nome de rua ' + onde + ': ' + x.txt + '. Mas no município há ' + x.kT + ' ruas com esse nome, em bairros diferentes; chance de os dois estarem na mesma delas: ' + fmtP0(x.mt) + '.']
+    : x.tipo === 'mesma' ? ['+', 'Mesma rua ' + onde + ': ' + x.txt + '.']
+    : x.tipo === 'dividida' ? ['~', 'A rua da consulta (' + (a.logradouro || '') + ') combina com ' + x.n + ' ruas ' + onde + ': ' + x.txt + '. Há mais de uma rua do CNEFE com nome igual ou parecido; a chance foi dividida entre elas pelo número, pelo bairro e pelo CEP.']
       : x.tipo === 'diferente' ? ['-', 'Ruas diferentes ' + onde + ': ' + x.txt + '.']
         : x.tipo === 'nao_achada' ? ['-', 'A rua da consulta não foi encontrada ' + onde + '.'] : null;
-  if (anos.length === 2 && rc['2010'].tipo === rc['2022'].tipo && rc['2010'].txt === rc['2022'].txt) { const f = frase(rc['2010'], 'no CNEFE 2010 e no CNEFE 2022'); if (f) add(f[0], f[1]); }
+  if (anos.length === 2 && rc['2010'].tipo === rc['2022'].tipo && rc['2010'].txt === rc['2022'].txt && !rc['2010'].varias && !rc['2022'].varias) { const f = frase(rc['2010'], 'no CNEFE 2010 e no CNEFE 2022'); if (f) add(f[0], f[1]); }
   else for (const ano of anos) { const f = frase(rc[ano], 'no CNEFE ' + ano); if (f) add(f[0], f[1]); }
   // 4. palavras do nome da rua em comum e em quantos setores do município cada uma aparece (tabela de tokens)
   const tA = geoLogradouro(a.logradouro || '').nucleo, tB = geoLogradouro(b.logradouro || '').nucleo;
@@ -6621,7 +6704,16 @@ function geoEvidencias(res, M, a, b) {
   // 5. número
   if (res.numero) {
     const cv = (res.censos['2022'] && res.censos['2022'].curva) || (res.censos['2010'] && res.censos['2010'].curva);
-    if (res.numero.dif === 0) add(mesmaRua === false ? '~' : '+', 'Mesmo número (' + res.numA.n + ')' + (res.numA.sufixo !== res.numB.sufixo && (res.numA.sufixo || res.numB.sufixo) ? ', com letras diferentes (' + (res.numA.sufixo || '-') + ' e ' + (res.numB.sufixo || '-') + ')' : '') + (mesmaRua === false ? ', mas em ruas diferentes.' : mesmaRua ? ' na mesma rua: é o mesmo imóvel.' : chanceMesmaRua > 0 ? '. Se a rua for a mesma (chance de ' + fmtP0(chanceMesmaRua) + '), é o mesmo imóvel.' : '.'));
+    if (res.numero.dif === 0) {
+      const letras = res.numA.sufixo !== res.numB.sufixo && (res.numA.sufixo || res.numB.sufixo) ? ', com letras diferentes (' + (res.numA.sufixo || '-') + ' e ' + (res.numB.sufixo || '-') + ')' : '';
+      const mt = R0 && R0.la ? R0.la.mesmoTrecho || 0 : 0;
+      const lN = R0 && R0.lb && R0.lb.ruas.length ? C0.ruas[R0.lb.ruas[0].i].l : null;
+      const kN = lN !== null && mesmaRua !== false ? geoTrechosComNumero(C0, lN, res.numA.n) : 0;
+      if (mesmaRua === false) add('~', 'Mesmo número (' + res.numA.n + ')' + letras + ', mas em ruas diferentes.');
+      else if (mt >= 0.9) add('+', 'Mesmo número (' + res.numA.n + ')' + letras + ' na mesma rua: é o mesmo imóvel.');
+      else if (kN > 1) add('~', 'Mesmo número (' + res.numA.n + ')' + letras + ' e mesmo nome de rua, mas há ' + kN + ' ruas chamadas ' + C0.logrs[lN].display + ' com o número ' + res.numA.n + ' no município (CNEFE ' + ano0 + '), em bairros diferentes. A chance de os dois estarem na mesma delas é de ' + fmtP0(mt) + ': sem bairro ou CEP que as diferencie, o número igual não garante o mesmo imóvel.');
+      else add('+', 'Mesmo número (' + res.numA.n + ')' + letras + (chanceMesmaRua > 0 ? '. Se a rua for a mesma (chance de ' + fmtP0(chanceMesmaRua) + '), é o mesmo imóvel.' : '.'));
+    }
     else {
       const lado = res.numero.mesmoLado ? 'do mesmo lado da rua (' + (res.numA.n % 2 ? 'ímpares' : 'pares') + ')' : 'em lados opostos da rua (um par e um ímpar)';
       let t = 'Números ' + res.numA.n + ' e ' + res.numB.n + ': diferença de ' + res.numero.dif + ', ' + lado + '.';
@@ -6680,14 +6772,17 @@ function geoEvidencias(res, M, a, b) {
       const r22 = res.censos['2022']; const tb = r22 && geoTopSetores(r22.lb.dist, 1)[0];
       const raio = tb ? geoRaioSetor(M.censos['2022'], tb[0]) : null;
       let sinal = '~';
+      // a posição de cada lado é só a hipótese mais provável; com várias ruas possíveis, a distância vale pouco
+      const incertos = [['consulta', res.coordA], ['candidato', res.coordB]].filter(([, c]) => c && Number.isFinite(c.certeza) && c.certeza < 0.5);
       if (raio) {
         t += ' Para comparar: no setor do candidato, metade dos endereços fica a até ' + fmtM(raio) + ' do centro do setor.';
         const mg = res.dist.margem || 0;
-        if (mg > 2 * raio) t += ' Como a margem é maior que o setor, a distância indica pouco.';
+        if (incertos.length) t += ' Mas ' + incertos.map(([q, c]) => 'a posição ' + (q === 'consulta' ? 'da consulta' : 'do candidato') + ' é só a mais provável (' + fmtP0(c.certeza) + ' de chance)').join(' e ') + ': há outras ruas ou trechos possíveis, então a distância indica pouco.';
+        else if (mg > 2 * raio) t += ' Como a margem é maior que o setor, a distância indica pouco.';
         else if (res.dist.m <= raio) { t += ' A distância é menor que isso: compatível com o mesmo setor.'; sinal = '+'; }
         else if (res.dist.m - mg > 3 * raio) { t += ' Mesmo descontando a margem, a distância é mais de 3 vezes maior: indica setores diferentes.'; sinal = '-'; }
         else t += ' A distância é parecida com o tamanho do setor: pode ser o mesmo setor ou um vizinho.';
-      }
+      } else if (incertos.length) t += ' A posição ' + incertos.map(([q]) => q === 'consulta' ? 'da consulta' : 'do candidato').join(' e ') + ' é só a mais provável: a distância indica pouco.';
       add(sinal, t);
     }
   }
@@ -6697,9 +6792,12 @@ function geoEvidencias(res, M, a, b) {
   for (const ano of anos) {
     const r = res.censos[ano]; const C = M.censos[ano];
     const ta = geoTopSetores(r.la.dist, 1)[0], tb = geoTopSetores(r.lb.dist, 1)[0];
+    // cada lado: no setor X (90% ou mais), ou espalhado por N setores (o mais provável, com a sua chance)
+    const ladoRes = (q, l, t) => !t ? q + ' não localizada' : t[1] >= 0.9 ? q + ' no setor ' + C.setores[t[0]] : q + ' espalhad' + (q === 'consulta' ? 'a' : 'o') + ' por ' + geoPl(geoOpcoes(l.dist).length || l.dist.size, 'setor', 'setores') + ' (o mais provável, ' + C.setores[t[0]] + ', com ' + fmtP0(t[1]) + ')';
     const resultado = !Number.isFinite(r.p) ? 'Resultado: sem informação neste censo.'
-      : ta && tb && ta[0] === tb[0] ? 'Resultado: os dois caem no setor ' + C.setores[ta[0]] + '; chance de mesmo setor de ' + fmtP0(r.p) + '.'
-        : 'Resultado: consulta mais provável no setor ' + (ta ? C.setores[ta[0]] : '-') + ' e candidato no ' + (tb ? C.setores[tb[0]] : '-') + '; chance de mesmo setor de ' + fmtP0(r.p) + '.';
+      : ta && tb && ta[0] === tb[0] && ta[1] >= 0.9 && tb[1] >= 0.9 ? 'Resultado: os dois caem no setor ' + C.setores[ta[0]] + '; chance de mesmo setor de ' + fmtP0(r.p) + '.'
+      : ta && tb && ta[0] === tb[0] ? 'Resultado: o setor mais provável é o mesmo para os dois, ' + C.setores[ta[0]] + ', mas com ' + fmtP0(ta[1]) + ' de chance para a consulta e ' + fmtP0(tb[1]) + ' para o candidato; chance de mesmo setor de ' + fmtP0(r.p) + '.'
+        : 'Resultado: ' + ladoRes('consulta', r.la, ta) + '; ' + ladoRes('candidato', r.lb, tb) + '; chance de mesmo setor de ' + fmtP0(r.p) + '.';
     const C2 = M.censos[ano === '2010' ? '2022' : '2010'];
     blocos.push({ titulo: 'CNEFE ' + ano, linhas: [geoDescreverLocal(C, r.la, 'A', a, C2), geoDescreverLocal(C, r.lb, 'B', b, C2), resultado] });
   }
